@@ -144,6 +144,7 @@ export function InsertUpdateRowForm(props: {
   rowsRefetch: () => void;
   schema: Table;
   row?: Record;
+  inline?: boolean;
 }) {
   const isUpdate = () => props.row !== undefined;
 
@@ -189,19 +190,37 @@ export function InsertUpdateRowForm(props: {
   });
 
   return (
-    <SheetContainer>
-      <SheetHeader>
-        <SheetTitle>{isUpdate() ? "Edit Row" : "Insert New Row"}</SheetTitle>
-      </SheetHeader>
-
+    <div class={props.inline ? "flex flex-col gap-4" : undefined}>
+      <Show
+        when={props.inline}
+        fallback={
+          <SheetContainer>
+            <SheetHeader>
+              <SheetTitle>
+                {isUpdate() ? "Edit Row" : "Insert New Row"}
+              </SheetTitle>
+            </SheetHeader>
+          </SheetContainer>
+        }
+      >
+        <div class="border-b pb-4">
+          <h2 class="m-0 text-lg font-semibold">Add content</h2>
+          <p class="text-muted-foreground mt-1 text-sm">
+            Enter values for the new record.
+          </p>
+        </div>
+      </Show>
       <form
+        class={props.inline ? "flex flex-col gap-4" : undefined}
         method="dialog"
         onSubmit={(e: SubmitEvent) => {
           e.preventDefault();
           form.handleSubmit();
         }}
       >
-        <div class="flex flex-col items-start gap-4 py-4">
+        <div
+          class={`flex flex-col items-start gap-4 ${props.inline ? "py-1" : "py-4"}`}
+        >
           <For each={props.schema.columns}>
             {(column: Column) => {
               return (
@@ -231,7 +250,7 @@ export function InsertUpdateRowForm(props: {
           </For>
         </div>
 
-        <SheetFooter>
+        <SheetFooter class={props.inline ? "border-t pt-4" : undefined}>
           <form.Subscribe
             selector={(state) => ({
               canSubmit: state.canSubmit,
@@ -255,7 +274,7 @@ export function InsertUpdateRowForm(props: {
           />
         </SheetFooter>
       </form>
-    </SheetContainer>
+    </div>
   );
 }
 

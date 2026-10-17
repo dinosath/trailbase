@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 use trailbase_schema::db::metadata::ColumnMetadata;
-use trailbase_schema::db::sqlite::{Column, ColumnDataType};
+use trailbase_schema::db::sqlite::{Column, ColumnDataType, ColumnOption};
 use trailbase_schema::json::flat_json_to_value;
 use trailbase_schema::json_schema::registry::JsonSchemaRegistry;
 use trailbase_schema::json_schema::{FileUpload, FileUploadInput, FileUploads};
@@ -24,6 +24,13 @@ pub(crate) type FileMetadataContents = Vec<(FileUpload, Option<Vec<u8>>)>;
 
 /// A JSON object representing a DB record/row.
 pub(crate) type JsonRow = serde_json::Map<String, serde_json::Value>;
+
+fn is_generated_column(column: &Column) -> bool {
+  column
+    .options
+    .iter()
+    .any(|option| matches!(option, ColumnOption::Generated { .. }))
+}
 
 #[derive(Debug)]
 pub struct NamedParam {
@@ -104,6 +111,9 @@ impl InsertParams {
       else {
         continue;
       };
+      if is_generated_column(column) {
+        continue;
+      }
 
       let (param, json_files) = extract_params_and_files_from_json(
         json_schema_registry,
@@ -147,9 +157,12 @@ impl InsertParams {
     // Insert parameters case.
     for (key, value) in row {
       // For admin operations we don't skip. There should not be client version skew.
-      let Some(ColumnMetadata { index, .. }) = accessor.column_by_name(&key) else {
+      let Some(ColumnMetadata { index, column, .. }) = accessor.column_by_name(&key) else {
         return Err(ParamsError::ColumnNotFound);
       };
+      if is_generated_column(column) {
+        return Err(ParamsError::Column("generated columns cannot be written"));
+      }
 
       params.push(NamedParam {
         column_index: *index,
@@ -235,6 +248,9 @@ impl UpdateParams {
       else {
         continue;
       };
+      if is_generated_column(column) {
+        continue;
+      }
 
       let (param, json_files) = extract_params_and_files_from_json(
         json_schema_registry,
@@ -313,6 +329,9 @@ impl UpdateParams {
       else {
         return Err(ParamsError::ColumnNotFound);
       };
+      if is_generated_column(column) {
+        return Err(ParamsError::Column("generated columns cannot be written"));
+      }
 
       let param: Value = if let Some(JsonColumnMetadata::SchemaName(schema_name)) = json.as_ref() {
         match schema_name.as_str() {

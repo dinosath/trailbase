@@ -56,6 +56,7 @@ import { FilterBar } from "@/components/FilterBar";
 import { DestructiveActionButton } from "@/components/DestructiveActionButton";
 import { IconButton } from "@/components/IconButton";
 import { InsertUpdateRowForm } from "@/components/explorer/InsertUpdateRow";
+import { RecordTransferDialog } from "@/components/explorer/RecordTransferDialog";
 import {
   RecordApiSettingsForm,
   hasRecordApis,
@@ -130,6 +131,7 @@ function TableHeaderRightHandButtons(props: {
   table: Table | View;
   allTables: Table[];
   schemaRefetch: () => Promise<void>;
+  rowsRefetch: () => void;
   postgres: boolean;
 }) {
   const selectedSchema = () => props.table;
@@ -169,6 +171,14 @@ function TableHeaderRightHandButtons(props: {
             Delete <TbOutlineTrash />
           </div>
         </DestructiveActionButton>
+      )}
+
+      {/* Import and export records for the selected table */}
+      {type() === "table" && !hidden() && (
+        <RecordTransferDialog
+          table={props.table as Table}
+          onImported={props.rowsRefetch}
+        />
       )}
 
       {/* Record API settings*/}
@@ -294,6 +304,7 @@ function TablePaneHeader(props: {
           table={selectedSchema()}
           allTables={allTables()}
           schemaRefetch={props.schemaRefetch}
+          rowsRefetch={props.rowsRefetch}
           postgres={props.postgres}
         />
       }

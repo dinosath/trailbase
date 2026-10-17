@@ -84,6 +84,9 @@ const LazyEditorPage = lazy(() => import("@/components/editor/EditorPage"));
 const LazyLogsPage = lazy(() => import("@/components/logs/LogsPage"));
 const LazyErdPage = lazy(() => import("@/components/erd/ErdPage"));
 const LazyOpenApiPage = lazy(() => import("@/components/openapi/OpenApiPage"));
+const LazyContentTypesPage = lazy(
+  () => import("@/components/content-types/ContentTypesPage").then((m) => ({ default: m.ContentTypesPage })),
+);
 
 const App: Component = () => {
   const user = useStore($user);
@@ -113,6 +116,7 @@ const App: Component = () => {
           <Route path="/erd" component={LazyErdPage} />
           <Route path="/logs" component={LazyLogsPage} />
           <Route path="/openapi" component={LazyOpenApiPage} />
+          <Route path="/content-types" component={LazyContentTypesPage} />
           <Route path="/settings/:group?" component={SettingsPage} />
 
           {/* fallback: */}

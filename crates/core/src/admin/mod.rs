@@ -1,5 +1,6 @@
 mod backup;
 mod config;
+mod content_types;
 mod email;
 mod error;
 mod info;
@@ -63,6 +64,17 @@ pub fn unprotected_admin_router() -> OpenApiRouter<AppState> {
     ))
     // Table & Index actions.
     .routes(routes!(table::list_tables::list_tables_handler))
+    // Content type definitions and their generated TrailBase record APIs.
+    .routes(routes!(
+      content_types::list_content_types,
+      content_types::create_content_type,
+    ))
+    .routes(routes!(
+      content_types::get_content_type,
+      content_types::update_content_type,
+      content_types::delete_content_type,
+    ))
+    .routes(routes!(content_types::update_content_type_views))
     // Config actions
     .routes(routes!(
       config::get_config::get_config_handler,

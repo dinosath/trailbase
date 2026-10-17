@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use trailbase_schema::db::QualifiedNameEscaped;
 use trailbase_schema::db::metadata::ColumnMetadata;
+use trailbase_schema::db::sqlite::ColumnOption;
 use trailbase_sqlite::traits::SyncTransaction;
 use trailbase_sqlite::{Connection, ConnectionType, Value};
 
@@ -47,17 +48,27 @@ impl WriteQuery {
     params: Arc<InsertParams>,
   ) -> Result<Self, RecordError> {
     let row_id_column = row_id_column(connection_type);
+    let replace_columns: Vec<ColumnMetadata> =
+      if conflict_resolution == proto::ConflictResolutionStrategy::Replace {
+        column_metadata
+          .iter()
+          .filter(|metadata| {
+            !metadata
+              .column
+              .options
+              .iter()
+              .any(|option| matches!(option, ColumnOption::Generated { .. }))
+          })
+          .cloned()
+          .collect()
+      } else {
+        Vec::new()
+      };
     let query = CreateOrReplaceRecordQueryTemplate {
       table_name,
       params: &params.params,
       pk_column_name,
-      column_metadata: match conflict_resolution {
-        proto::ConflictResolutionStrategy::Replace => column_metadata,
-        proto::ConflictResolutionStrategy::Ignore => &[],
-        proto::ConflictResolutionStrategy::Abort | proto::ConflictResolutionStrategy::Undefined => {
-          &[]
-        }
-      },
+      column_metadata: &replace_columns,
       ignore_conflict: matches!(
         conflict_resolution,
         proto::ConflictResolutionStrategy::Ignore

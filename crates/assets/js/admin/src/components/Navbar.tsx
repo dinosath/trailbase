@@ -20,6 +20,7 @@ import {
   TbOutlineSun,
   TbOutlinePackage,
   TbOutlineApi,
+  TbOutlineForms,
 } from "solid-icons/tb";
 
 import { AuthButton } from "@/components/auth/AuthButton";
@@ -52,6 +53,7 @@ const options = [
   [`${BASE}/wasm/`, TbOutlinePackage, "WASM Components"],
   [`${BASE}/logs`, TbOutlineTimeline, "Logs & Metrics"],
   [`${BASE}/openapi`, TbOutlineApi, "OpenApi"],
+  [`${BASE}/content-types`, TbOutlineForms, "Content Types"],
   [`${BASE}/settings/`, TbOutlineSettings, "Settings"],
 ] as const;
 
