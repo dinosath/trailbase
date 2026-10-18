@@ -65,6 +65,15 @@ pub struct ContentTypeAttribute {
   pub enum_values: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub relation_target: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub relation_cardinality: Option<String>,
+  #[serde(
+    default,
+    rename = "attributes",
+    skip_serializing_if = "Option::is_none"
+  )]
+  #[schema(ignore)]
+  pub relation_attributes: Option<BTreeMap<String, ContentTypeAttribute>>,
   #[serde(default)]
   pub computed: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +82,27 @@ pub struct ContentTypeAttribute {
   pub stored: Option<bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub dependencies: Vec<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rollup: Option<ContentTypeRollup>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentTypeRollup {
+  pub relation: String,
+  pub field: String,
+  #[serde(default = "default_rollup_aggregate")]
+  pub aggregate: String,
+  #[serde(default = "default_rollup_stored")]
+  pub stored: bool,
+}
+
+fn default_rollup_aggregate() -> String {
+  "sum".to_string()
+}
+
+fn default_rollup_stored() -> bool {
+  true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -214,6 +244,17 @@ pub struct ContentTypeResponse {
 pub struct DeleteContentTypeResponse {
   pub uid: String,
   pub table_name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteContentTypesRequest {
+  pub uids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteContentTypesResponse {
+  pub uids: Vec<String>,
 }
 
 fn quote_identifier(name: &str) -> String {
@@ -564,22 +605,86 @@ fn normalize_attributes(
   attributes
     .into_iter()
     .map(|(name, mut attribute)| {
+      if let Some(relation_attributes) = attribute.relation_attributes.take() {
+        attribute.relation_attributes = Some(normalize_attributes(relation_attributes)?);
+      }
       if attribute.computed {
-        let expression = attribute.expression.as_deref().unwrap_or_default();
-        attribute.dependencies = parse_generated_expression(expression)
-          .map_err(|err| {
-            Error::Precondition(format!("Invalid generated expression for `{name}`: {err}"))
-          })?
-          .into_iter()
-          .collect();
+        if attribute.rollup.is_some() {
+          attribute.dependencies.clear();
+        } else {
+          let expression = attribute.expression.as_deref().unwrap_or_default();
+          attribute.dependencies = parse_generated_expression(expression)
+            .map_err(|err| {
+              Error::Precondition(format!("Invalid generated expression for `{name}`: {err}"))
+            })?
+            .into_iter()
+            .collect();
+        }
       } else {
         attribute.expression = None;
         attribute.stored = None;
         attribute.dependencies.clear();
+        attribute.rollup = None;
       }
       Ok((name, attribute))
     })
     .collect()
+}
+
+fn sql_view_default(attribute: &ContentTypeAttribute) -> Option<&str> {
+  let default = attribute.default.as_ref()?.as_object()?;
+  if default.get("type")?.as_str()? != "sqlView" {
+    return None;
+  }
+  default.get("sql")?.as_str()
+}
+
+fn is_sql_view_default(attribute: &ContentTypeAttribute) -> bool {
+  sql_view_default(attribute).is_some()
+}
+
+fn validate_sql_view_default(name: &str, attribute: &ContentTypeAttribute) -> Result<(), Error> {
+  let Some(default) = attribute
+    .default
+    .as_ref()
+    .and_then(serde_json::Value::as_object)
+  else {
+    return Ok(());
+  };
+  if default.get("type").and_then(serde_json::Value::as_str) != Some("sqlView") {
+    return Err(Error::Precondition(format!(
+      "Structured default for `{name}` must use type `sqlView`"
+    )));
+  }
+  let sql = default
+    .get("sql")
+    .and_then(serde_json::Value::as_str)
+    .map(str::trim)
+    .filter(|sql| !sql.is_empty())
+    .ok_or_else(|| Error::Precondition(format!("SQL view default for `{name}` requires SQL")))?;
+  let starts_with_query = ["SELECT", "WITH"].into_iter().any(|keyword| {
+    sql
+      .get(..keyword.len())
+      .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+      && sql
+        .as_bytes()
+        .get(keyword.len())
+        .is_some_and(u8::is_ascii_whitespace)
+  });
+  if !starts_with_query || sql.contains(';') || sql.contains('\0') {
+    return Err(Error::Precondition(format!(
+      "SQL view default for `{name}` must be a single SELECT or WITH query"
+    )));
+  }
+  if default
+    .keys()
+    .any(|key| !matches!(key.as_str(), "type" | "sql"))
+  {
+    return Err(Error::Precondition(format!(
+      "SQL view default for `{name}` supports only `type` and `sql`"
+    )));
+  }
+  Ok(())
 }
 
 fn validate_content_type(request: &CreateContentTypeRequest) -> Result<(), Error> {
@@ -648,16 +753,25 @@ fn validate_content_type(request: &CreateContentTypeRequest) -> Result<(), Error
       }
     }
     if let Some(default) = &attribute.default {
-      let valid = match attribute.field_type.as_str() {
-        "integer" | "biginteger" | "decimal" | "float" => default.is_number(),
-        "boolean" => default.is_boolean() || default.is_null(),
-        "json" | "media" => true,
-        _ => default.is_string() || default.is_number() || default.is_null(),
-      };
-      if !valid {
-        return Err(Error::Precondition(format!(
-          "Default value has an incompatible type for `{name}`"
-        )));
+      if default
+        .as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("sqlView")
+      {
+        validate_sql_view_default(name, attribute)?;
+      } else {
+        let valid = match attribute.field_type.as_str() {
+          "integer" | "biginteger" | "decimal" | "float" => default.is_number(),
+          "boolean" => default.is_boolean() || default.is_null(),
+          "json" | "media" => true,
+          _ => default.is_string() || default.is_number() || default.is_null(),
+        };
+        if !valid {
+          return Err(Error::Precondition(format!(
+            "Default value has an incompatible type for `{name}`"
+          )));
+        }
       }
     }
     if (attribute.min_length.is_some() || attribute.max_length.is_some())
@@ -701,7 +815,8 @@ fn validate_content_type(request: &CreateContentTypeRequest) -> Result<(), Error
     if !attribute.computed
       && (attribute.expression.is_some()
         || attribute.stored.is_some()
-        || !attribute.dependencies.is_empty())
+        || !attribute.dependencies.is_empty()
+        || attribute.rollup.is_some())
     {
       return Err(Error::Precondition(format!(
         "Generated-column settings on `{name}` require computed=true"
@@ -723,6 +838,50 @@ fn validate_content_type(request: &CreateContentTypeRequest) -> Result<(), Error
         return Err(Error::Precondition(format!(
           "Generated field `{name}` cannot have a default value"
         )));
+      }
+      if let Some(rollup) = &attribute.rollup {
+        if attribute.expression.is_some()
+          || !rollup.stored
+          || rollup.aggregate != "sum"
+          || !matches!(
+            attribute.field_type.as_str(),
+            "integer" | "biginteger" | "decimal" | "float"
+          )
+        {
+          return Err(Error::Precondition(format!(
+            "Stored rollup `{name}` must be a numeric SUM and cannot also have an expression"
+          )));
+        }
+        let Some(relation) = request.attributes.get(&rollup.relation) else {
+          return Err(Error::Precondition(format!(
+            "Rollup `{name}` references unknown relation `{}`",
+            rollup.relation
+          )));
+        };
+        if !is_many_to_many(relation) {
+          return Err(Error::Precondition(format!(
+            "Rollup `{name}` must reference a many-to-many relation"
+          )));
+        }
+        let relation_field = relation
+          .relation_attributes
+          .as_ref()
+          .and_then(|attributes| attributes.get(&rollup.field))
+          .ok_or_else(|| {
+            Error::Precondition(format!(
+              "Rollup `{name}` references unknown relation field `{}.{}`",
+              rollup.relation, rollup.field
+            ))
+          })?;
+        if !matches!(
+          relation_field.field_type.as_str(),
+          "integer" | "biginteger" | "decimal" | "float"
+        ) {
+          return Err(Error::Precondition(format!(
+            "Rollup `{name}` must sum a numeric relation field"
+          )));
+        }
+        continue;
       }
       let expression = attribute
         .expression
@@ -775,6 +934,56 @@ fn validate_content_type(request: &CreateContentTypeRequest) -> Result<(), Error
         "Relation field `{name}` must select a target content type"
       )));
     }
+    if attribute.field_type == "relation" {
+      let cardinality = attribute
+        .relation_cardinality
+        .as_deref()
+        .unwrap_or("manyToOne");
+      if !matches!(cardinality, "manyToOne" | "manyToMany") {
+        return Err(Error::Precondition(format!(
+          "Unsupported relation cardinality `{cardinality}` for `{name}`"
+        )));
+      }
+      let relation_attributes = attribute
+        .relation_attributes
+        .as_ref()
+        .filter(|attributes| !attributes.is_empty());
+      if relation_attributes.is_some() && cardinality != "manyToMany" {
+        return Err(Error::Precondition(format!(
+          "Only many-to-many relations can define additional attributes (`{name}`)"
+        )));
+      }
+      if let Some(relation_attributes) = relation_attributes {
+        if relation_attributes.values().any(|field| {
+          field.field_type == "relation"
+            && (field.relation_cardinality.as_deref() == Some("manyToMany")
+              || field
+                .relation_attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty()))
+        }) {
+          return Err(Error::Precondition(format!(
+            "Relation fields inside many-to-many attributes must be many-to-one (`{name}`)"
+          )));
+        }
+        let nested = CreateContentTypeRequest {
+          uid: request.uid.clone(),
+          kind: "collectionType".to_string(),
+          info: request.info.clone(),
+          attributes: relation_attributes.clone(),
+        };
+        validate_content_type(&nested)?;
+      }
+    } else if attribute.relation_cardinality.is_some()
+      || attribute
+        .relation_attributes
+        .as_ref()
+        .is_some_and(|attributes| !attributes.is_empty())
+    {
+      return Err(Error::Precondition(format!(
+        "Only relation fields can define relation metadata (`{name}`)"
+      )));
+    }
     if let Some(target) = &attribute.relation_target {
       validate_uid(target)?;
     }
@@ -808,12 +1017,15 @@ fn table_columns(
     "\"updated_at\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP".to_string(),
   ];
   for (name, attribute) in attributes {
+    if is_many_to_many(attribute) {
+      continue;
+    }
     let mut definition = format!(
       "{} {}",
       quote_identifier(name),
       field_sql_type(&attribute.field_type)?
     );
-    if attribute.required && !attribute.computed {
+    if attribute.required && !attribute.computed && !is_sql_view_default(attribute) {
       definition.push_str(" NOT NULL");
     }
     if attribute.unique && !attribute.computed {
@@ -823,7 +1035,7 @@ fn table_columns(
       definition.push_str(" UNIQUE");
     }
     if let Some(default) = &attribute.default {
-      if !attribute.computed {
+      if !attribute.computed && !is_sql_view_default(attribute) {
         definition.push_str(&format!(" DEFAULT {}", sql_literal(default)?));
       }
     }
@@ -903,7 +1115,7 @@ fn table_columns(
         }
       ));
     }
-    if attribute.computed {
+    if attribute.computed && attribute.rollup.is_none() {
       let expression = attribute.expression.as_deref().ok_or_else(|| {
         Error::Precondition(format!(
           "Generated field `{name}` is missing its expression"
@@ -923,6 +1135,297 @@ fn table_columns(
   Ok(columns)
 }
 
+fn is_many_to_many(attribute: &ContentTypeAttribute) -> bool {
+  attribute.field_type == "relation"
+    && attribute.relation_cardinality.as_deref() == Some("manyToMany")
+}
+
+fn relation_targets(attributes: &BTreeMap<String, ContentTypeAttribute>) -> BTreeSet<&str> {
+  fn collect<'a>(attribute: &'a ContentTypeAttribute, targets: &mut BTreeSet<&'a str>) {
+    if attribute.field_type == "relation"
+      && let Some(target) = attribute.relation_target.as_deref()
+    {
+      targets.insert(target);
+    }
+    if let Some(nested) = &attribute.relation_attributes {
+      for attribute in nested.values() {
+        collect(attribute, targets);
+      }
+    }
+  }
+
+  let mut targets = BTreeSet::new();
+  for attribute in attributes.values() {
+    collect(attribute, &mut targets);
+  }
+  targets
+}
+
+fn many_to_many_table_name(source_table: &str, relation_name: &str) -> String {
+  format!("{source_table}_rel_{relation_name}")
+}
+
+fn many_to_many_table_sql(
+  table_name: &str,
+  source_table: &str,
+  attribute: &ContentTypeAttribute,
+  target_table: &str,
+  relation_tables: &BTreeMap<String, String>,
+) -> Result<String, Error> {
+  let mut columns = vec![
+    "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string(),
+    format!(
+      "\"source_id\" INTEGER NOT NULL REFERENCES {} (id) ON DELETE CASCADE",
+      quote_identifier(source_table)
+    ),
+    format!(
+      "\"target_id\" INTEGER NOT NULL REFERENCES {} (id) ON DELETE RESTRICT",
+      quote_identifier(target_table)
+    ),
+    "\"created_at\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP".to_string(),
+    "\"updated_at\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP".to_string(),
+  ];
+  let fields = attribute
+    .relation_attributes
+    .as_ref()
+    .cloned()
+    .unwrap_or_default();
+  columns.extend(table_columns(&fields, relation_tables)?.into_iter().skip(3));
+  if fields.is_empty() {
+    columns.push("UNIQUE (\"source_id\", \"target_id\")".to_string());
+  }
+  Ok(format!(
+    "CREATE TABLE {} ({}) STRICT",
+    quote_identifier(table_name),
+    columns.join(", ")
+  ))
+}
+
+fn sql_default_trigger_statement(
+  table_name: &str,
+  attributes: &BTreeMap<String, ContentTypeAttribute>,
+) -> Option<String> {
+  let defaults = attributes
+    .iter()
+    .filter_map(|(name, attribute)| {
+      sql_view_default(attribute).map(|sql| (name, attribute, sql.trim()))
+    })
+    .collect::<Vec<_>>();
+  if defaults.is_empty() {
+    return None;
+  }
+
+  let assignments = defaults
+    .iter()
+    .map(|(name, _, sql)| {
+      let column = quote_identifier(name);
+      format!("{column} = CASE WHEN NEW.{column} IS NULL THEN ({sql}) ELSE NEW.{column} END")
+    })
+    .collect::<Vec<_>>()
+    .join(", ");
+  let required_checks = defaults
+    .iter()
+    .filter(|(_, attribute, _)| attribute.required)
+    .map(|(name, _, _)| {
+      let column = quote_identifier(name);
+      let message = format!("Required SQL default `{name}` returned NULL").replace('\'', "''");
+      format!(
+        "SELECT CASE WHEN (SELECT {column} FROM {table} WHERE \"id\" = NEW.\"id\") IS NULL \
+         THEN RAISE(ABORT, '{message}') END;",
+        table = quote_identifier(table_name)
+      )
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+
+  Some(format!(
+    "CREATE TRIGGER {} AFTER INSERT ON {} BEGIN \
+       UPDATE {} SET {assignments} WHERE \"id\" = NEW.\"id\"; \
+       {required_checks} \
+     END",
+    quote_identifier(&format!("{table_name}_sql_defaults_insert")),
+    quote_identifier(table_name),
+    quote_identifier(table_name)
+  ))
+}
+
+fn rollup_fields_for_relation<'a>(
+  attributes: &'a BTreeMap<String, ContentTypeAttribute>,
+  relation_name: &str,
+) -> Vec<(&'a str, &'a ContentTypeAttribute, &'a ContentTypeRollup)> {
+  attributes
+    .iter()
+    .filter_map(|(name, attribute)| {
+      attribute
+        .rollup
+        .as_ref()
+        .filter(|rollup| rollup.relation == relation_name)
+        .map(|rollup| (name.as_str(), attribute, rollup))
+    })
+    .collect()
+}
+
+fn rollup_sum_expression(
+  relation_table: &str,
+  rollup: &ContentTypeRollup,
+  source_id: &str,
+) -> String {
+  format!(
+    "COALESCE((SELECT SUM({field}) FROM {relation_table} WHERE \"source_id\" = {source_id}), 0)",
+    field = quote_identifier(&rollup.field),
+    relation_table = quote_identifier(relation_table)
+  )
+}
+
+fn rollup_trigger_statements(
+  source_table: &str,
+  relation_name: &str,
+  relation_table: &str,
+  attributes: &BTreeMap<String, ContentTypeAttribute>,
+) -> Vec<String> {
+  let fields = rollup_fields_for_relation(attributes, relation_name);
+  if fields.is_empty() {
+    return Vec::new();
+  }
+
+  let update_for = |source_id: &str| {
+    fields
+      .iter()
+      .map(|(name, _, rollup)| {
+        format!(
+          "{} = {}",
+          quote_identifier(name),
+          rollup_sum_expression(relation_table, rollup, source_id)
+        )
+      })
+      .collect::<Vec<_>>()
+      .join(", ")
+  };
+  let target_names = fields
+    .iter()
+    .map(|(name, _, _)| quote_identifier(name))
+    .collect::<Vec<_>>()
+    .join(", ");
+  let mut statements = vec![
+    format!(
+      "CREATE TRIGGER {} AFTER INSERT ON {} BEGIN \
+         UPDATE {} SET {} WHERE \"id\" = NEW.\"source_id\"; \
+       END",
+      quote_identifier(&format!("{relation_table}_rollup_insert")),
+      quote_identifier(relation_table),
+      quote_identifier(source_table),
+      update_for("NEW.\"source_id\"")
+    ),
+    format!(
+      "CREATE TRIGGER {} AFTER DELETE ON {} BEGIN \
+         UPDATE {} SET {} WHERE \"id\" = OLD.\"source_id\"; \
+       END",
+      quote_identifier(&format!("{relation_table}_rollup_delete")),
+      quote_identifier(relation_table),
+      quote_identifier(source_table),
+      update_for("OLD.\"source_id\"")
+    ),
+    format!(
+      "CREATE TRIGGER {} AFTER UPDATE ON {} BEGIN \
+         UPDATE {} AS parent SET {} WHERE parent.\"id\" IN (OLD.\"source_id\", NEW.\"source_id\"); \
+       END",
+      quote_identifier(&format!("{relation_table}_rollup_update")),
+      quote_identifier(relation_table),
+      quote_identifier(source_table),
+      update_for("parent.\"id\"")
+    ),
+  ];
+
+  // A rollup is stored for fast reads but remains read-only to ordinary writes.
+  // The only accepted values are the current aggregate values.
+  let mut insert_checks = Vec::new();
+  let mut update_checks = Vec::new();
+  let mut insert_assignments = Vec::new();
+  for (name, _, rollup) in &fields {
+    let column = quote_identifier(name);
+    let expected = rollup_sum_expression(relation_table, rollup, "NEW.\"id\"");
+    insert_checks.push(format!(
+      "(NEW.{column} IS NOT NULL AND NEW.{column} IS NOT {expected})"
+    ));
+    update_checks.push(format!("(NEW.{column} IS NOT {expected})"));
+    insert_assignments.push(format!("{column} = {expected}"));
+  }
+  let check_expr = insert_checks.join(" OR ");
+  let update_check_expr = update_checks.join(" OR ");
+  let message = "Stored relation rollups are read-only";
+  statements.push(format!(
+    "CREATE TRIGGER {} BEFORE INSERT ON {} WHEN {check_expr} \
+       BEGIN SELECT RAISE(ABORT, '{message}'); END",
+    quote_identifier(&format!(
+      "{source_table}_rollup_insert_guard_{relation_name}"
+    )),
+    quote_identifier(source_table)
+  ));
+  statements.push(format!(
+    "CREATE TRIGGER {} BEFORE UPDATE OF {target_names} ON {} WHEN {update_check_expr} \
+       BEGIN SELECT RAISE(ABORT, '{message}'); END",
+    quote_identifier(&format!(
+      "{source_table}_rollup_update_guard_{relation_name}"
+    )),
+    quote_identifier(source_table)
+  ));
+  statements.push(format!(
+    "CREATE TRIGGER {} AFTER INSERT ON {} BEGIN UPDATE {} SET {} WHERE \"id\" = NEW.\"id\"; END",
+    quote_identifier(&format!("{source_table}_rollup_init_{relation_name}")),
+    quote_identifier(source_table),
+    quote_identifier(source_table),
+    insert_assignments.join(", ")
+  ));
+  statements.push(format!(
+    "UPDATE {} AS parent SET {}",
+    quote_identifier(source_table),
+    update_for("parent.\"id\"")
+  ));
+  statements
+}
+
+fn many_to_many_table_statements(
+  source_table: &str,
+  attributes: &BTreeMap<String, ContentTypeAttribute>,
+  relation_tables: &BTreeMap<String, String>,
+) -> Result<Vec<String>, Error> {
+  attributes
+    .iter()
+    .filter(|(_, attribute)| is_many_to_many(attribute))
+    .try_fold(Vec::new(), |mut statements, (name, attribute)| {
+      let target_uid = attribute.relation_target.as_deref().ok_or_else(|| {
+        Error::Precondition(format!("Relation field `{name}` is missing its target"))
+      })?;
+      let target_table = relation_tables.get(target_uid).ok_or_else(|| {
+        Error::Precondition(format!("Related collection `{target_uid}` was not found"))
+      })?;
+      let relation_table = many_to_many_table_name(source_table, name);
+      statements.push(many_to_many_table_sql(
+        &relation_table,
+        source_table,
+        attribute,
+        target_table,
+        relation_tables,
+      )?);
+      if let Some(trigger) = sql_default_trigger_statement(
+        &relation_table,
+        attribute
+          .relation_attributes
+          .as_ref()
+          .unwrap_or(&BTreeMap::new()),
+      ) {
+        statements.push(trigger);
+      }
+      statements.extend(rollup_trigger_statements(
+        source_table,
+        name,
+        &relation_table,
+        attributes,
+      ));
+      Ok(statements)
+    })
+}
+
 async fn relation_table_names(
   conn: &trailbase_sqlite::Connection,
   attributes: &BTreeMap<String, ContentTypeAttribute>,
@@ -930,11 +1433,8 @@ async fn relation_table_names(
   own_table_name: &str,
 ) -> Result<BTreeMap<String, String>, Error> {
   let mut names = BTreeMap::new();
-  for target_uid in attributes
-    .values()
-    .filter(|attribute| attribute.field_type == "relation")
-    .filter_map(|attribute| attribute.relation_target.as_deref())
-  {
+  let targets = relation_targets(attributes);
+  for target_uid in targets {
     if target_uid == own_uid {
       names.insert(target_uid.to_string(), own_table_name.to_string());
       continue;
@@ -1210,6 +1710,10 @@ pub async fn create_content_type(
     relation_table_names(&conn, &request.attributes, &request.uid, &table_name).await?;
   let attributes = normalize_attributes(request.attributes)?;
   let columns = table_columns(&attributes, &relation_tables)?;
+  let mut relation_sql = many_to_many_table_statements(&table_name, &attributes, &relation_tables)?;
+  if let Some(trigger) = sql_default_trigger_statement(&table_name, &attributes) {
+    relation_sql.push(trigger);
+  }
 
   let schema = ContentTypeSchema {
     uid: request.uid,
@@ -1229,6 +1733,9 @@ pub async fn create_content_type(
     .transaction(move |tx| {
       let mut tx = TransactionRecorder::new(tx);
       tx.execute(create_sql, ())?;
+      for statement in relation_sql {
+        tx.execute(statement, ())?;
+      }
       tx.rollback()
         .map_err(|err| trailbase_sqlite::Error::Other(err.into()))
     })
@@ -1362,7 +1869,11 @@ pub async fn update_content_type(
       .iter()
       .find_map(|(old, new)| (new == name).then_some(old))
       .unwrap_or(name);
-    if attribute.required && !old_schema.attributes.contains_key(source_name) && row_count > 0 {
+    if attribute.required
+      && !is_sql_view_default(attribute)
+      && !old_schema.attributes.contains_key(source_name)
+      && row_count > 0
+    {
       return Err(Error::Precondition(format!(
         "Cannot add required field `{name}` while records already exist"
       )));
@@ -1417,7 +1928,7 @@ pub async fn update_content_type(
       .map(|name| quote_identifier(name))
       .collect::<Vec<_>>();
     for (name, attribute) in &schema.attributes {
-      if attribute.computed {
+      if attribute.computed || is_many_to_many(attribute) {
         continue;
       }
       columns.push(name.clone());
@@ -1425,7 +1936,11 @@ pub async fn update_content_type(
         .iter()
         .find_map(|(old, new)| (new == name).then_some(old))
         .unwrap_or(name);
-      if old_schema.attributes.contains_key(source_name) {
+      if old_schema
+        .attributes
+        .get(source_name)
+        .is_some_and(|attribute| !is_many_to_many(attribute))
+      {
         let column = quote_identifier(source_name);
         let old_type = &old_schema.attributes[source_name].field_type;
         if old_type != &attribute.field_type {
@@ -1457,13 +1972,116 @@ pub async fn update_content_type(
       quote_identifier(&table_name),
     );
     let old_table = quote_identifier(&table_name);
+    let relation_sql =
+      many_to_many_table_statements(&table_name, &schema.attributes, &relation_tables)?;
+    let mut statements = Vec::new();
+    let mut staged_relations = BTreeMap::new();
+    for (old_name, old_attribute) in &old_schema.attributes {
+      if !is_many_to_many(old_attribute) {
+        continue;
+      }
+      let relation_table = many_to_many_table_name(&table_name, old_name);
+      let exists: bool = conn
+        .read_query_row_get(
+          "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+          trailbase_sqlite::params!(relation_table.clone()),
+          0,
+        )
+        .await?
+        .unwrap_or(false);
+      if !exists {
+        continue;
+      }
+      let staging_table = format!("{relation_table}_stage_{}", uuid::Uuid::new_v4().simple());
+      statements.push(format!(
+        "CREATE TABLE {} AS SELECT * FROM {}",
+        quote_identifier(&staging_table),
+        quote_identifier(&relation_table)
+      ));
+      statements.push(format!("DROP TABLE {}", quote_identifier(&relation_table)));
+      staged_relations.insert(old_name.clone(), staging_table);
+    }
+    statements.extend([create_sql, copy_sql]);
+    statements.push(format!("DROP TABLE {old_table}"));
+    statements.push(rename_sql);
+    statements.extend(relation_sql);
+    if let Some(trigger) = sql_default_trigger_statement(&table_name, &schema.attributes) {
+      statements.push(trigger);
+    }
+    for (new_name, new_attribute) in &schema.attributes {
+      if !is_many_to_many(new_attribute) {
+        continue;
+      }
+      let old_name = renamed_attributes
+        .iter()
+        .find_map(|(old, new)| (new == new_name).then_some(old.as_str()))
+        .unwrap_or(new_name);
+      let Some(staging_table) = staged_relations.get(old_name) else {
+        continue;
+      };
+      let Some(old_attribute) = old_schema.attributes.get(old_name) else {
+        continue;
+      };
+      let mut columns = vec![
+        "id".to_string(),
+        "source_id".to_string(),
+        "target_id".to_string(),
+        "created_at".to_string(),
+        "updated_at".to_string(),
+      ];
+      let mut expressions = columns
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Vec<_>>();
+      for (field_name, new_field) in new_attribute
+        .relation_attributes
+        .as_ref()
+        .into_iter()
+        .flat_map(|fields| fields.iter())
+      {
+        let Some(old_field) = old_attribute
+          .relation_attributes
+          .as_ref()
+          .and_then(|fields| fields.get(field_name))
+        else {
+          continue;
+        };
+        if new_field.computed || old_field.computed {
+          continue;
+        }
+        columns.push(field_name.clone());
+        let column = quote_identifier(field_name);
+        expressions.push(if old_field.field_type == new_field.field_type {
+          column
+        } else {
+          format!(
+            "CAST({column} AS {})",
+            field_sql_type(&new_field.field_type)?
+          )
+        });
+      }
+      let target_table = many_to_many_table_name(&table_name, new_name);
+      statements.push(format!(
+        "INSERT INTO {} ({}) SELECT {} FROM {}",
+        quote_identifier(&target_table),
+        columns
+          .iter()
+          .map(|name| quote_identifier(name))
+          .collect::<Vec<_>>()
+          .join(", "),
+        expressions.join(", "),
+        quote_identifier(staging_table)
+      ));
+    }
+    for (_, staging_table) in staged_relations {
+      statements.push(format!("DROP TABLE {}", quote_identifier(&staging_table)));
+    }
     let tx_log = conn
       .transaction(move |tx| {
         let mut tx = TransactionRecorder::new(tx);
-        tx.execute(create_sql, ())?;
-        tx.execute(copy_sql, ())?;
-        tx.execute(format!("DROP TABLE {old_table}"), ())?;
-        tx.execute(rename_sql, ())?;
+        for statement in statements {
+          tx.execute(statement, ())?;
+        }
         tx.rollback()
           .map_err(|err| trailbase_sqlite::Error::Other(err.into()))
       })
@@ -1559,11 +2177,24 @@ pub async fn delete_content_type(
   state
     .validate_and_update_config(config, Some(old_config_hash))
     .await?;
-  let drop_sql = format!("DROP TABLE {}", quote_identifier(&table_name));
+  let mut drop_statements = schema
+    .attributes
+    .iter()
+    .filter(|(_, attribute)| is_many_to_many(attribute))
+    .map(|(name, _)| {
+      format!(
+        "DROP TABLE IF EXISTS {}",
+        quote_identifier(&many_to_many_table_name(&table_name, name))
+      )
+    })
+    .collect::<Vec<_>>();
+  drop_statements.push(format!("DROP TABLE {}", quote_identifier(&table_name)));
   let tx_log = conn
     .transaction(move |tx| {
       let mut tx = TransactionRecorder::new(tx);
-      tx.execute(drop_sql, ())?;
+      for statement in drop_statements {
+        tx.execute(statement, ())?;
+      }
       tx.rollback()
         .map_err(|err| trailbase_sqlite::Error::Other(err.into()))
     })
@@ -1585,4 +2216,160 @@ pub async fn delete_content_type(
     .await?;
   state.rebuild_connection_metadata().await?;
   Ok(Json(DeleteContentTypeResponse { uid, table_name }))
+}
+
+#[utoipa::path(
+  delete,
+  path = "/content-types",
+  tag = "content-types",
+  request_body = DeleteContentTypesRequest,
+  responses((status = 200, description = "Deleted content types", body = DeleteContentTypesResponse))
+)]
+pub async fn delete_content_types(
+  State(state): State<AppState>,
+  Json(request): Json<DeleteContentTypesRequest>,
+) -> Result<Json<DeleteContentTypesResponse>, Error> {
+  if state.demo_mode() {
+    return Err(Error::Precondition("Disallowed in demo".into()));
+  }
+  let requested_uids: BTreeSet<String> = request.uids.into_iter().collect();
+  if requested_uids.is_empty() {
+    return Err(Error::Precondition(
+      "Select at least one content type to delete".into(),
+    ));
+  }
+
+  let conn = connection(&state).await?;
+  ensure_registry(&conn).await?;
+  let schemas = load_all(&conn).await?;
+  let selected: Vec<ContentTypeSchema> = schemas
+    .iter()
+    .filter(|schema| requested_uids.contains(&schema.uid))
+    .cloned()
+    .collect();
+  if selected.len() != requested_uids.len() {
+    let found: BTreeSet<_> = selected.iter().map(|schema| schema.uid.as_str()).collect();
+    let missing: Vec<_> = requested_uids
+      .iter()
+      .filter(|uid| !found.contains(uid.as_str()))
+      .cloned()
+      .collect();
+    return Err(Error::Precondition(format!(
+      "Content types not found: {}",
+      missing.join(", ")
+    )));
+  }
+
+  let selected_names: BTreeMap<_, _> = selected
+    .iter()
+    .map(|schema| (schema.uid.as_str(), schema.info.display_name.as_str()))
+    .collect();
+  let blockers: BTreeSet<String> = schemas
+    .iter()
+    .filter(|schema| !requested_uids.contains(&schema.uid))
+    .flat_map(|schema| {
+      relation_targets(&schema.attributes)
+        .into_iter()
+        .filter(|target| requested_uids.contains(*target))
+        .map(|target| {
+          format!(
+            "{} → {}",
+            schema.info.display_name,
+            selected_names.get(target).copied().unwrap_or(target)
+          )
+        })
+        .collect::<Vec<_>>()
+    })
+    .collect();
+  if !blockers.is_empty() {
+    return Err(Error::Precondition(format!(
+      "Cannot delete these content types while unselected types have relations to them: {}",
+      blockers.into_iter().collect::<Vec<_>>().join(", ")
+    )));
+  }
+
+  let mut relation_tables = Vec::new();
+  let mut table_names = Vec::with_capacity(selected.len());
+  for schema in &selected {
+    let table_name = schema
+      .table_name
+      .clone()
+      .ok_or_else(|| Error::Precondition(format!("Missing content table for {}", schema.uid)))?;
+    relation_tables.extend(
+      schema
+        .attributes
+        .iter()
+        .filter(|(_, attribute)| is_many_to_many(attribute))
+        .map(|(name, _)| many_to_many_table_name(&table_name, name)),
+    );
+    table_names.push(table_name);
+  }
+
+  // Removing every selected type as one unit permits cycles among selected
+  // types, while the blocker check above protects unselected types and data.
+  // Defer foreign keys while deleting all selected records so cyclic relations
+  // do not prevent the cleanup. Drop junction tables before their base tables.
+  let mut statements = vec!["PRAGMA defer_foreign_keys = ON".to_string()];
+  statements.extend(
+    relation_tables
+      .iter()
+      .map(|table| format!("DROP TABLE IF EXISTS {}", quote_identifier(table))),
+  );
+  statements.extend(
+    table_names
+      .iter()
+      .map(|table| format!("DELETE FROM {}", quote_identifier(table))),
+  );
+  statements.extend(
+    table_names
+      .iter()
+      .map(|table| format!("DROP TABLE {}", quote_identifier(table))),
+  );
+
+  let tx_log = conn
+    .transaction(move |tx| {
+      let mut tx = TransactionRecorder::new(tx);
+      for statement in statements {
+        tx.execute(statement, ())?;
+      }
+      tx.rollback()
+        .map_err(|err| trailbase_sqlite::Error::Other(err.into()))
+    })
+    .await?;
+
+  let selected_tables: BTreeSet<_> = table_names.iter().map(String::as_str).collect();
+  let mut config = (*state.get_config()).clone();
+  let old_config_hash = proto::hash_config(&config);
+  config.record_apis.retain(|api| {
+    api
+      .table_name
+      .as_deref()
+      .is_none_or(|table_name| !selected_tables.contains(table_name))
+  });
+  state
+    .validate_and_update_config(config, Some(old_config_hash))
+    .await?;
+
+  if let Some(tx_log) = tx_log {
+    tx_log
+      .apply_as_migration(
+        &conn,
+        state.data_dir().migrations_path().join("main"),
+        "content_types_bulk_delete",
+      )
+      .await?;
+  }
+
+  for schema in &selected {
+    conn
+      .write_query_row(
+        format!("DELETE FROM {REGISTRY_TABLE} WHERE uid = ?"),
+        trailbase_sqlite::params!(schema.uid.clone()),
+      )
+      .await?;
+  }
+  state.rebuild_connection_metadata().await?;
+  Ok(Json(DeleteContentTypesResponse {
+    uids: selected.into_iter().map(|schema| schema.uid).collect(),
+  }))
 }

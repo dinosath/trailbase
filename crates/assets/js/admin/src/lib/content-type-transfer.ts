@@ -432,9 +432,22 @@ function evaluatePath(value: unknown, expression: string): unknown[] {
     throw new Error(`Expected a jq-style path, got “${expression}”.`);
   let current = [value];
   let index = 1;
+  // jq paths allow a root object key directly after the leading dot (for
+  // example `.info`). Bracket selectors such as `.["display-name"]` and
+  // array selectors such as `.[]` continue through the loop below.
+  if (index < expression.length && /[A-Za-z0-9_]/.test(expression[index])) {
+    const start = index;
+    while (index < expression.length && /[A-Za-z0-9_]/.test(expression[index]))
+      index += 1;
+    const key = expression.slice(start, index);
+    current = current.flatMap((item) =>
+      isRecord(item) && key in item ? [item[key]] : [],
+    );
+  }
   while (index < expression.length) {
     if (expression[index] === ".") {
       index += 1;
+      if (expression[index] === "[") continue;
       const start = index;
       while (
         index < expression.length &&

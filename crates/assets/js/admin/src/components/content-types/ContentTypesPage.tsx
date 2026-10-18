@@ -1,16 +1,27 @@
 import { For, Show, createSignal } from "solid-js";
+import { Dynamic } from "solid-js/web";
 import { useQuery, useQueryClient } from "@tanstack/solid-query";
 import {
   TbOutlineDotsVertical,
   TbOutlineBraces,
   TbOutlineCalendar,
+  TbOutlineClock,
   TbOutlineDatabase,
   TbOutlineDownload,
   TbOutlineEdit,
   TbOutlineFileText,
+  TbOutlineAt,
+  TbOutlineBlocks,
+  TbOutlineKey,
   TbOutlineLetterA,
+  TbOutlineLink,
+  TbOutlineList,
+  TbOutlineLockPassword,
+  TbOutlineNumber123,
+  TbOutlinePhoto,
   TbOutlinePlus,
   TbOutlineTrash,
+  TbOutlineToggleRight,
   TbOutlineUpload,
 } from "solid-icons/tb";
 import { stringify as stringifyYaml } from "yaml";
@@ -19,6 +30,7 @@ import { Header } from "@/components/Header";
 import { showToast } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
 import { buttonVariants } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
@@ -37,14 +49,12 @@ import {
   SidebarGroup,
   SidebarGroupContent,
   SidebarGroupLabel,
-  SidebarFooter,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarProvider,
-  SidebarRail,
 } from "@/components/ui/sidebar";
 import { TextField, TextFieldInput } from "@/components/ui/text-field";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -57,6 +67,7 @@ import {
 import {
   createContentType,
   deleteContentType,
+  deleteContentTypes,
   listContentTypes,
   updateContentType,
   type ContentTypeAttribute,
@@ -69,29 +80,192 @@ import {
   parseImportDocument,
 } from "@/lib/content-type-transfer";
 
-function contentTypeBundle(value: unknown): ContentTypeSchema[] | undefined {
+function normalizeContentTypeBundle(
+  value: unknown,
+): ContentTypeSchema[] | undefined {
   const candidate = Array.isArray(value)
     ? value
     : value && typeof value === "object" && "contentTypes" in value
       ? (value as { contentTypes: unknown }).contentTypes
       : undefined;
   if (!Array.isArray(candidate) || candidate.length === 0) return undefined;
-  for (const item of candidate) {
-    if (!item || typeof item !== "object") return undefined;
-    const schema = item as Partial<ContentTypeSchema>;
-    if (
-      !schema.uid ||
-      !["collectionType", "singleType"].includes(schema.kind ?? "") ||
-      !schema.info?.displayName ||
-      !schema.info.singularName ||
-      !schema.info.pluralName ||
-      !schema.attributes ||
-      typeof schema.attributes !== "object"
-    ) {
-      return undefined;
+  const definitions = candidate.filter(
+    (item): item is Record<string, unknown> =>
+      item !== null && typeof item === "object" && !Array.isArray(item),
+  );
+  if (definitions.length !== candidate.length) return undefined;
+
+  const compatible = definitions.every((item) => {
+    const info = item.info as Record<string, unknown> | undefined;
+    return (
+      typeof info?.singularName === "string" &&
+      item.attributes !== null &&
+      typeof item.attributes === "object" &&
+      !Array.isArray(item.attributes)
+    );
+  });
+  if (!compatible) return undefined;
+
+  // Accept content type definitions from different JSON/YAML producers. Fill
+  // TrailBase's generated identity fields and normalize common field aliases
+  // without depending on a particular export format.
+  const slug = slugify;
+  const infoOf = (item: Record<string, unknown>) =>
+    item.info as {
+      singularName: string;
+      pluralName?: string;
+      displayName?: string;
+      description?: string;
+    };
+  const normalizeUid = (item: Record<string, unknown>, singular: string) => {
+    const providedUid =
+      typeof item.uid === "string" && item.uid.trim()
+        ? item.uid.trim()
+        : `api::${singular}.${singular}`;
+    return providedUid
+      .split(/(::|\.)/)
+      .map((segment) => (/^(::|\.)$/.test(segment) ? segment : slug(segment)))
+      .join("");
+  };
+  const uidBySourceUid = new Map<string, string>();
+  for (const item of definitions) {
+    const info = infoOf(item);
+    const normalizedSingular = slug(info.singularName);
+    const uid = normalizeUid(item, normalizedSingular);
+    for (const externalUid of [
+      item.uid,
+      `api::${info.singularName}.${info.singularName}`,
+      info.pluralName
+        ? `api::${info.pluralName}.${info.pluralName}`
+        : undefined,
+    ]) {
+      if (typeof externalUid === "string") uidBySourceUid.set(externalUid, uid);
     }
   }
-  return candidate as ContentTypeSchema[];
+
+  const normalizeAttribute = (value: unknown): ContentTypeAttribute => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { type: String(value ?? "string") };
+    }
+    const sourceAttribute = value as Record<string, unknown>;
+    const {
+      enum: enumValues,
+      fieldType,
+      target,
+      relation,
+      mappedBy: _mappedBy,
+      inversedBy: _inversedBy,
+      ...rest
+    } = sourceAttribute;
+    const attributeType =
+      sourceAttribute.type === "enum"
+        ? "enumeration"
+        : String(sourceAttribute.type ?? fieldType ?? "string");
+    const sourceTarget =
+      typeof sourceAttribute.relationTarget === "string"
+        ? sourceAttribute.relationTarget
+        : target;
+    const relationTarget =
+      attributeType === "relation" && typeof sourceTarget === "string"
+        ? (uidBySourceUid.get(sourceTarget) ?? sourceTarget)
+        : undefined;
+    const relationName = String(
+      sourceAttribute.relationCardinality ?? relation ?? "",
+    )
+      .toLowerCase()
+      .replaceAll(/[-_\s]/g, "");
+    const relationCardinality =
+      attributeType !== "relation"
+        ? undefined
+        : relationName === "manytomany"
+          ? "manyToMany"
+          : ["manytoone", "onetomany", "onetoone"].includes(relationName)
+            ? "manyToOne"
+            : undefined;
+    const nestedSource = sourceAttribute.attributes;
+    const nestedAttributes =
+      nestedSource &&
+      typeof nestedSource === "object" &&
+      !Array.isArray(nestedSource)
+        ? Object.fromEntries(
+            Object.entries(nestedSource).map(([name, attribute]) => [
+              slug(name),
+              normalizeAttribute(attribute),
+            ]),
+          )
+        : undefined;
+    const generatedExpression =
+      typeof rest.expression === "string" ? rest.expression.trim() : "";
+    const rollup =
+      rest.rollup &&
+      typeof rest.rollup === "object" &&
+      !Array.isArray(rest.rollup)
+        ? (rest.rollup as Record<string, unknown>)
+        : undefined;
+    const keepRollup =
+      rest.computed === true &&
+      typeof rollup?.relation === "string" &&
+      typeof rollup.field === "string" &&
+      (rollup.aggregate === undefined || rollup.aggregate === "sum") &&
+      (rollup.stored === undefined || rollup.stored === true);
+    // The server validates the supported expression grammar. Preserve SQL
+    // functions here so valid generated formulas survive import/export.
+    const keepComputed =
+      rest.computed === true && (keepRollup || generatedExpression.length > 0);
+
+    return {
+      ...rest,
+      type: attributeType,
+      ...(Array.isArray(rest.enumValues)
+        ? {}
+        : Array.isArray(enumValues)
+          ? { enumValues }
+          : {}),
+      ...(relationTarget ? { relationTarget } : {}),
+      ...(relationCardinality ? { relationCardinality } : {}),
+      ...(nestedAttributes ? { attributes: nestedAttributes } : {}),
+      ...(keepComputed
+        ? { computed: true }
+        : {
+            computed: undefined,
+            expression: undefined,
+            stored: undefined,
+            dependencies: undefined,
+            rollup: undefined,
+          }),
+    } as ContentTypeAttribute;
+  };
+
+  return definitions.map((item) => {
+    const info = infoOf(item);
+    const normalizedSingular = slug(info.singularName);
+    const sourceAttributes = item.attributes as Record<string, unknown>;
+    const attributes = Object.fromEntries(
+      Object.entries(sourceAttributes).map(([name, value]) => [
+        slug(name),
+        normalizeAttribute(value),
+      ]),
+    );
+    const normalizedPlural = slug(
+      info.pluralName ?? pluralize(normalizedSingular),
+    );
+    return {
+      uid: normalizeUid(item, normalizedSingular),
+      kind: item.kind === "singleType" ? "singleType" : "collectionType",
+      info: {
+        ...info,
+        singularName: normalizedSingular,
+        pluralName: normalizedPlural,
+        displayName:
+          info.displayName ??
+          normalizedSingular
+            .split("_")
+            .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+            .join(" "),
+      },
+      attributes,
+    } as ContentTypeSchema;
+  });
 }
 
 type FieldDraft = {
@@ -101,11 +275,16 @@ type FieldDraft = {
   unique: boolean;
   enumValues: string;
   relationTarget: string;
+  relationCardinality: "manyToOne" | "manyToMany";
+  relationAttributes: Record<string, ContentTypeAttribute>;
   computed: boolean;
   expression: string;
   stored: boolean;
   private: boolean;
   defaultValue: string;
+  defaultMode: "value" | "sqlView";
+  defaultSql: string;
+  rollup?: ContentTypeAttribute["rollup"];
   min: string;
   max: string;
   minLength: string;
@@ -129,83 +308,81 @@ const fieldTypeOptions = [
     type: "string",
     label: "Text",
     description: "Short or long text values",
-    mark: "Aa",
   },
   {
     type: "boolean",
     label: "Boolean",
     description: "Yes or no, true or false",
-    mark: "●",
   },
   {
     type: "richtext",
     label: "Rich text (Blocks)",
     description: "Structured rich text content",
-    mark: "⋮",
   },
   {
     type: "json",
     label: "JSON",
     description: "Structured data in JSON format",
-    mark: "{}",
   },
   {
     type: "decimal",
     label: "Number",
     description: "Integer or decimal values",
-    mark: "123",
   },
-  { type: "email", label: "Email", description: "An email address", mark: "@" },
-  { type: "date", label: "Date", description: "A calendar date", mark: "▦" },
+  { type: "email", label: "Email", description: "An email address" },
+  { type: "date", label: "Date", description: "A calendar date" },
   {
     type: "password",
     label: "Password",
     description: "A password value",
-    mark: "●",
   },
   {
     type: "media",
     label: "Media",
     description: "JSON file or media references",
-    mark: "▧",
   },
   {
     type: "enumeration",
     label: "Enumeration",
     description: "Choose from a fixed list of values",
-    mark: "☷",
   },
   {
     type: "relation",
     label: "Relation",
     description: "Reference another collection type",
-    mark: "↗",
   },
   {
     type: "uid",
     label: "UID",
     description: "A unique text identifier",
-    mark: "⌘",
   },
   {
     type: "richtext_markdown",
     label: "Rich text (Markdown)",
     description: "Markdown formatted text",
-    mark: "≡",
   },
 ];
 
 function ContentTypePickerItems(props: {
   schemas: ContentTypeSchema[];
   selectedUid: string | undefined;
+  selectedUids: string[];
   onSelect: (uid: string) => void;
+  onToggleSelection: (uid: string, checked: boolean) => void;
 }) {
   const { setOpenMobile } = useSidebar();
   return (
     <For each={props.schemas}>
       {(schema) => (
-        <SidebarMenuItem>
+        <SidebarMenuItem class="flex items-center gap-1">
+          <Checkbox
+            class="ml-2"
+            aria-label={`Select ${schema.info.displayName}`}
+            checked={props.selectedUids.includes(schema.uid)}
+            onChange={(checked) => props.onToggleSelection(schema.uid, checked)}
+          />
           <SidebarMenuButton
+            class="min-w-0 flex-1"
             isActive={props.selectedUid === schema.uid}
             tooltip={schema.info.displayName}
             onClick={() => {
@@ -305,36 +482,120 @@ function parseDefaultValue(type: string, rawValue: string): unknown {
   return rawValue;
 }
 
-function FieldTypeBadge(props: { type: string }) {
-  const iconClass =
-    "flex size-9 shrink-0 items-center justify-center rounded border border-primary/20 bg-primary/5 text-primary";
+function sqlViewDefaultSql(value: unknown): string | undefined {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).type === "sqlView" &&
+    typeof (value as Record<string, unknown>).sql === "string"
+  ) {
+    return (value as { sql: string }).sql;
+  }
+  return undefined;
+}
+
+function hasSqlViewDefault(attribute: ContentTypeAttribute): boolean {
   return (
-    <span class={iconClass} aria-hidden="true">
-      <Show when={props.type === "date" || props.type === "datetime"}>
-        <TbOutlineCalendar class="size-4" />
-      </Show>
-      <Show when={props.type === "json"}>
-        <TbOutlineBraces class="size-4" />
-      </Show>
-      <Show when={props.type === "richtext" || props.type === "text"}>
-        <TbOutlineFileText class="size-4" />
-      </Show>
-      <Show
-        when={
-          props.type !== "date" &&
-          props.type !== "datetime" &&
-          props.type !== "json" &&
-          props.type !== "richtext" &&
-          props.type !== "text"
-        }
-      >
-        <Show
-          when={props.type === "string" || props.type === "email"}
-          fallback="#"
-        >
-          <TbOutlineLetterA class="size-4" />
-        </Show>
-      </Show>
+    sqlViewDefaultSql(attribute.default) !== undefined ||
+    Object.values(attribute.attributes ?? {}).some(hasSqlViewDefault)
+  );
+}
+
+function withoutSqlViewDefaults(
+  attribute: ContentTypeAttribute,
+): ContentTypeAttribute {
+  const { default: defaultValue, ...withoutDefault } = attribute;
+  const result =
+    sqlViewDefaultSql(defaultValue) === undefined
+      ? attribute
+      : withoutDefault;
+  if (!attribute.attributes) return result;
+  return {
+    ...result,
+    attributes: Object.fromEntries(
+      Object.entries(attribute.attributes).map(([name, child]) => [
+        name,
+        withoutSqlViewDefaults(child),
+      ]),
+    ),
+  };
+}
+
+function literalDefaultValue(value: unknown): string {
+  if (value === undefined || sqlViewDefaultSql(value) !== undefined) return "";
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function FieldTypeIcon(props: { type: string }) {
+  const icons = {
+    boolean: TbOutlineToggleRight,
+    richtext: TbOutlineBlocks,
+    json: TbOutlineBraces,
+    integer: TbOutlineNumber123,
+    biginteger: TbOutlineNumber123,
+    decimal: TbOutlineNumber123,
+    float: TbOutlineNumber123,
+    email: TbOutlineAt,
+    date: TbOutlineCalendar,
+    datetime: TbOutlineCalendar,
+    time: TbOutlineClock,
+    password: TbOutlineLockPassword,
+    media: TbOutlinePhoto,
+    enumeration: TbOutlineList,
+    relation: TbOutlineLink,
+    uid: TbOutlineKey,
+    richtext_markdown: TbOutlineFileText,
+  };
+  return (
+    <Dynamic
+      component={icons[props.type as keyof typeof icons] ?? TbOutlineLetterA}
+    />
+  );
+}
+
+function FieldTypeBadge(props: { type: string; large?: boolean }) {
+  const colorClass = () => {
+    switch (props.type) {
+      case "string":
+      case "text":
+      case "boolean":
+        return "border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-400";
+      case "richtext":
+      case "json":
+        return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-400";
+      case "decimal":
+      case "float":
+      case "integer":
+      case "biginteger":
+      case "email":
+        return "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400";
+      case "date":
+      case "datetime":
+      case "time":
+      case "password":
+        return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400";
+      case "media":
+      case "enumeration":
+        return "border-purple-500/30 bg-purple-500/10 text-purple-700 dark:text-purple-400";
+      case "relation":
+      case "uid":
+        return "border-indigo-500/30 bg-indigo-500/10 text-indigo-700 dark:text-indigo-400";
+      case "richtext_markdown":
+        return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-400";
+      default:
+        return "border-primary/20 bg-primary/5 text-primary";
+    }
+  };
+  const sizeClass = () => (props.large ? "size-10" : "size-9");
+  return (
+    <span
+      class={`flex ${sizeClass()} shrink-0 items-center justify-center rounded-sm border ${colorClass()}`}
+      aria-hidden="true"
+    >
+      <span class={props.large ? "size-5 text-xl" : "size-4 text-base"}>
+        <FieldTypeIcon type={props.type} />
+      </span>
     </span>
   );
 }
@@ -346,6 +607,9 @@ export function ContentTypesPage() {
     queryFn: listContentTypes,
   }));
   const [selectedUid, setSelectedUid] = createSignal<string>();
+  const [selectedUids, setSelectedUids] = createSignal<string[]>([]);
+  const [exportUids, setExportUids] = createSignal<string[] | undefined>();
+  const [sidebarWidth, setSidebarWidth] = createSignal(224);
   const [activeTab, setActiveTab] = createSignal<
     "fields" | "views" | "settings"
   >("fields");
@@ -365,11 +629,15 @@ export function ContentTypesPage() {
     unique: false,
     enumValues: "",
     relationTarget: "",
+    relationCardinality: "manyToOne",
+    relationAttributes: {},
     computed: false,
     expression: "",
     stored: true,
     private: false,
     defaultValue: "",
+    defaultMode: "value",
+    defaultSql: "",
     min: "",
     max: "",
     minLength: "",
@@ -402,6 +670,19 @@ export function ContentTypesPage() {
 
   const selectedSchema = () =>
     contentTypes.data?.find((schema) => schema.uid === selectedUid());
+  const visibleSchemas = () =>
+    (contentTypes.data ?? []).filter((schema) =>
+      `${schema.info.displayName} ${schema.uid}`
+        .toLowerCase()
+        .includes(search().toLowerCase()),
+    );
+  const visibleSelectionState = () => {
+    const visible = visibleSchemas();
+    const selectedCount = visible.filter((schema) =>
+      selectedUids().includes(schema.uid),
+    ).length;
+    return visible.length > 0 && selectedCount === visible.length;
+  };
   const editingSchema = () => {
     const current = modal();
     return current?.kind === "metadata" && current.uid
@@ -422,6 +703,7 @@ export function ContentTypesPage() {
   function closeModal() {
     if (busy() || transferBusy()) return;
     setModal(null);
+    setExportUids(undefined);
     setError(undefined);
   }
 
@@ -463,16 +745,19 @@ export function ContentTypesPage() {
             unique: attribute.unique ?? false,
             enumValues: (attribute.enumValues ?? []).join("\n"),
             relationTarget: attribute.relationTarget ?? "",
+            relationCardinality: attribute.relationCardinality ?? "manyToOne",
+            relationAttributes: attribute.attributes ?? {},
             computed: attribute.computed ?? false,
             expression: attribute.expression ?? "",
             stored: attribute.stored ?? true,
             private: attribute.private ?? false,
-            defaultValue:
-              attribute.default === undefined
-                ? ""
-                : typeof attribute.default === "string"
-                  ? attribute.default
-                  : JSON.stringify(attribute.default),
+            defaultValue: literalDefaultValue(attribute.default),
+            defaultMode:
+              sqlViewDefaultSql(attribute.default) === undefined
+                ? "value"
+                : "sqlView",
+            defaultSql: sqlViewDefaultSql(attribute.default) ?? "",
+            rollup: attribute.rollup,
             min: attribute.min === undefined ? "" : String(attribute.min),
             max: attribute.max === undefined ? "" : String(attribute.max),
             minLength:
@@ -495,11 +780,15 @@ export function ContentTypesPage() {
             unique: false,
             enumValues: "",
             relationTarget: "",
+            relationCardinality: "manyToOne",
+            relationAttributes: {},
             computed: false,
             expression: "",
             stored: true,
             private: false,
             defaultValue: "",
+            defaultMode: "value",
+            defaultSql: "",
             min: "",
             max: "",
             minLength: "",
@@ -579,6 +868,28 @@ export function ContentTypesPage() {
     }
   }
 
+  function updateRelationAttribute(
+    name: string,
+    update: Partial<ContentTypeAttribute>,
+    nextName = name,
+  ) {
+    const attributes = { ...fieldDraft().relationAttributes };
+    const attribute = attributes[name];
+    if (!attribute) return;
+    delete attributes[name];
+    attributes[nextName || name] = { ...attribute, ...update };
+    setFieldDraft({ ...fieldDraft(), relationAttributes: attributes });
+  }
+
+  function addRelationAttribute() {
+    const attributes = { ...fieldDraft().relationAttributes };
+    let index = Object.keys(attributes).length + 1;
+    let name = `attribute_${index}`;
+    while (attributes[name]) name = `attribute_${++index}`;
+    attributes[name] = { type: "string", required: false, computed: false };
+    setFieldDraft({ ...fieldDraft(), relationAttributes: attributes });
+  }
+
   async function saveField() {
     const current = modal();
     const schema = selectedSchema();
@@ -606,11 +917,77 @@ export function ContentTypesPage() {
       setError("Choose a collection type for this relation.");
       return;
     }
-    if (fieldDraft().computed && !fieldDraft().expression.trim()) {
+    if (
+      fieldDraft().type === "relation" &&
+      fieldDraft().relationCardinality === "manyToMany"
+    ) {
+      const relationAttributes = Object.entries(
+        fieldDraft().relationAttributes,
+      );
+      const names = relationAttributes.map(([attributeName]) =>
+        slugify(attributeName),
+      );
+      if (names.some((attributeName) => !attributeName)) {
+        setError("Enter a name for each relation attribute.");
+        return;
+      }
+      if (new Set(names).size !== names.length) {
+        setError("Relation attribute names must be unique.");
+        return;
+      }
+      if (
+        relationAttributes.some(
+          ([, attribute]) =>
+            attribute.computed && !attribute.expression?.trim(),
+        )
+      ) {
+        setError("Enter an expression for each generated relation attribute.");
+        return;
+      }
+      if (
+        relationAttributes.some(([, attribute]) => {
+          if (
+            attribute.default === undefined ||
+            attribute.computed ||
+            sqlViewDefaultSql(attribute.default) !== undefined
+          ) {
+            return false;
+          }
+          if (
+            ["integer", "biginteger", "decimal", "float"].includes(
+              attribute.type,
+            )
+          ) {
+            return (
+              typeof attribute.default !== "number" ||
+              !Number.isFinite(attribute.default)
+            );
+          }
+          return false;
+        })
+      ) {
+        setError("Enter a valid default value for each relation attribute.");
+        return;
+      }
+    }
+    if (
+      fieldDraft().computed &&
+      !fieldDraft().rollup &&
+      !fieldDraft().expression.trim()
+    ) {
       setError("Enter an expression for the generated field.");
       return;
     }
     if (
+      fieldDraft().defaultMode === "sqlView" &&
+      !fieldDraft().computed &&
+      !fieldDraft().defaultSql.trim()
+    ) {
+      setError("Enter a SELECT query for the SQL view default.");
+      return;
+    }
+    if (
+      fieldDraft().defaultMode === "value" &&
       ["integer", "biginteger", "decimal", "float"].includes(
         fieldDraft().type,
       ) &&
@@ -621,6 +998,7 @@ export function ContentTypesPage() {
       return;
     }
     if (
+      fieldDraft().defaultMode === "value" &&
       ["json", "media"].includes(fieldDraft().type) &&
       fieldDraft().defaultValue.trim()
     ) {
@@ -641,6 +1019,11 @@ export function ContentTypesPage() {
     }
     const attributes = { ...schema.attributes };
     if (current.name) delete attributes[current.name];
+    const relationAttributes = Object.fromEntries(
+      Object.entries(fieldDraft().relationAttributes).map(
+        ([attributeName, attribute]) => [slugify(attributeName), attribute],
+      ),
+    );
     attributes[name] = {
       type: fieldDraft().type,
       required: fieldDraft().computed ? false : fieldDraft().required,
@@ -648,14 +1031,21 @@ export function ContentTypesPage() {
         ? false
         : fieldDraft().type === "uid" || fieldDraft().unique,
       private: fieldDraft().private,
-      ...(fieldDraft().defaultValue.trim() && !fieldDraft().computed
+      ...(!fieldDraft().computed && fieldDraft().defaultMode === "sqlView"
         ? {
-            default: parseDefaultValue(
-              fieldDraft().type,
-              fieldDraft().defaultValue,
-            ),
+            default: {
+              type: "sqlView",
+              sql: fieldDraft().defaultSql.trim(),
+            },
           }
-        : {}),
+        : fieldDraft().defaultValue.trim() && !fieldDraft().computed
+          ? {
+              default: parseDefaultValue(
+                fieldDraft().type,
+                fieldDraft().defaultValue,
+              ),
+            }
+          : {}),
       ...(fieldDraft().min.trim()
         ? {
             min: Number.isFinite(Number(fieldDraft().min))
@@ -689,8 +1079,10 @@ export function ContentTypesPage() {
       computed: fieldDraft().computed,
       ...(fieldDraft().computed
         ? {
-            expression: fieldDraft().expression.trim(),
             stored: fieldDraft().stored,
+            ...(fieldDraft().rollup
+              ? { rollup: fieldDraft().rollup }
+              : { expression: fieldDraft().expression.trim() }),
           }
         : {}),
       ...(fieldDraft().type === "enumeration"
@@ -702,7 +1094,14 @@ export function ContentTypesPage() {
           }
         : {}),
       ...(fieldDraft().type === "relation"
-        ? { relationTarget: fieldDraft().relationTarget }
+        ? {
+            relationTarget: fieldDraft().relationTarget,
+            relationCardinality: fieldDraft().relationCardinality,
+            ...(fieldDraft().relationCardinality === "manyToMany" &&
+            Object.keys(relationAttributes).length > 0
+              ? { attributes: relationAttributes }
+              : { attributes: null }),
+          }
         : {}),
     };
     await persistAttributes(
@@ -756,13 +1155,47 @@ export function ContentTypesPage() {
     }
   }
 
+  async function removeSelected() {
+    const allSchemas = contentTypes.data ?? [];
+    const selected = allSchemas.filter((schema) =>
+      selectedUids().includes(schema.uid),
+    );
+    if (selected.length === 0) return;
+    const names = selected.map((schema) => schema.info.displayName).join(", ");
+    if (
+      !window.confirm(
+        `Delete ${selected.length} content type${selected.length === 1 ? "" : "s"} (${names}) and all of their records?`,
+      )
+    )
+      return;
+
+    setPageError(undefined);
+    setBusy(true);
+    try {
+      await deleteContentTypes(selected.map((schema) => schema.uid));
+      if (selected.some((schema) => schema.uid === selectedUid())) {
+        setSelectedUid(undefined);
+      }
+      setSelectedUids([]);
+      await queryClient.invalidateQueries({ queryKey: ["content-types"] });
+      showToast({
+        title: "Content types deleted",
+        description: `Deleted ${selected.length} content types.`,
+      });
+    } catch (err) {
+      setPageError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function loadImportFile(file: File) {
     setError(undefined);
     setPageError(undefined);
     try {
       const root = parseImportDocument(await file.text(), file.name);
       setDefinitionImportRoot(root);
-      const bundle = contentTypeBundle(root);
+      const bundle = normalizeContentTypeBundle(root);
       if (bundle) {
         setImportDefinitions(bundle);
         setDefinitionMappingRequired(false);
@@ -779,7 +1212,7 @@ export function ContentTypesPage() {
         setDefinitionMapping(selector);
         try {
           const mapped = applyJqMapping(root, selector);
-          const mappedBundle = contentTypeBundle(mapped);
+          const mappedBundle = normalizeContentTypeBundle(mapped);
           if (!mappedBundle) {
             throw new Error(
               "Mapping must produce content type definitions with uid, kind, info, and attributes.",
@@ -805,7 +1238,7 @@ export function ContentTypesPage() {
     setDefinitionMapping(expression);
     try {
       const mapped = applyJqMapping(definitionImportRoot(), expression);
-      const bundle = contentTypeBundle(mapped);
+      const bundle = normalizeContentTypeBundle(mapped);
       if (!bundle) {
         throw new Error(
           "Mapping must produce content type definitions with uid, kind, info, and attributes.",
@@ -826,13 +1259,69 @@ export function ContentTypesPage() {
     setError(undefined);
     setTransferBusy(true);
     try {
-      for (const item of importDefinitions()) {
+      const definitions = importDefinitions();
+      const definitionsWithDeferredFields: ContentTypeSchema[] = [];
+      const definitionsWithSqlDefaults: ContentTypeSchema[] = [];
+      for (const item of definitions) {
         const {
           tableName: _tableName,
           databaseSchema: _databaseSchema,
           ...definition
         } = item;
-        await createContentType(definition);
+        const deferredAttributes = Object.fromEntries(
+          Object.entries(definition.attributes).filter(
+            ([, attribute]) =>
+              attribute.type === "relation" ||
+              attribute.computed === true ||
+              sqlViewDefaultSql(attribute.default) !== undefined,
+          ),
+        );
+        const attributes = Object.fromEntries(
+          Object.entries(definition.attributes).filter(
+            ([, attribute]) =>
+              attribute.type !== "relation" &&
+              attribute.computed !== true &&
+              sqlViewDefaultSql(attribute.default) === undefined,
+          ),
+        );
+        await createContentType({ ...definition, attributes });
+        if (Object.keys(deferredAttributes).length > 0) {
+          definitionsWithDeferredFields.push({
+            ...definition,
+            attributes: Object.fromEntries(
+              Object.entries({ ...attributes, ...deferredAttributes }).map(
+                ([name, attribute]) => [
+                  name,
+                  withoutSqlViewDefaults(attribute),
+                ],
+              ),
+            ),
+          });
+        }
+        if (Object.values(definition.attributes).some(hasSqlViewDefault)) {
+          definitionsWithSqlDefaults.push(definition);
+        }
+      }
+      // Create every relation table and generated field before installing SQL
+      // defaults. SQL-default triggers may query other relation tables, so all
+      // of those tables must exist before SQLite compiles the trigger bodies.
+      for (const definition of definitionsWithDeferredFields) {
+        await updateContentType(definition.uid, {
+          uid: definition.uid,
+          kind: definition.kind,
+          info: definition.info,
+          attributes: definition.attributes,
+        });
+      }
+      // Install SQL defaults last so cross-content-type queries in defaults can
+      // safely reference relations whose definitions occur later in the file.
+      for (const definition of definitionsWithSqlDefaults) {
+        await updateContentType(definition.uid, {
+          uid: definition.uid,
+          kind: definition.kind,
+          info: definition.info,
+          attributes: definition.attributes,
+        });
       }
       setModal(null);
       await queryClient.invalidateQueries({ queryKey: ["content-types"] });
@@ -848,13 +1337,19 @@ export function ContentTypesPage() {
   }
 
   function exportDefinitions() {
-    const definitions = (contentTypes.data ?? []).map(
-      ({
-        tableName: _tableName,
-        databaseSchema: _databaseSchema,
-        ...definition
-      }) => definition,
-    );
+    const selectedForExport = exportUids();
+    const definitions = (contentTypes.data ?? [])
+      .filter(
+        (schema) =>
+          !selectedForExport || selectedForExport.includes(schema.uid),
+      )
+      .map(
+        ({
+          tableName: _tableName,
+          databaseSchema: _databaseSchema,
+          ...definition
+        }) => definition,
+      );
     const bundle = {
       format: "trailbase-content-types",
       version: 1,
@@ -869,6 +1364,7 @@ export function ContentTypesPage() {
         : "application/json;charset=utf-8",
     );
     setModal(null);
+    setExportUids(undefined);
     showToast({
       title: "Export complete",
       description: `Exported ${definitions.length} content types.`,
@@ -894,7 +1390,10 @@ export function ContentTypesPage() {
       }}
     >
       <div class="size-full min-h-0">
-        <SidebarProvider class="h-full min-h-0">
+        <SidebarProvider
+          class="h-full min-h-0"
+          style={{ "--sidebar-width": `${sidebarWidth()}px` }}
+        >
           <Sidebar
             class="absolute"
             variant="sidebar"
@@ -902,6 +1401,17 @@ export function ContentTypesPage() {
             collapsible="offcanvas"
           >
             <SidebarHeader class="gap-3 p-3">
+              <input
+                ref={importFileInput}
+                type="file"
+                accept=".json,.yaml,.yml,application/json,application/yaml,text/yaml"
+                class="hidden"
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = "";
+                  if (file) void loadImportFile(file);
+                }}
+              />
               <div class="flex items-center justify-between gap-2">
                 <div class="min-w-0">
                   <div class="font-semibold">Content Types</div>
@@ -909,14 +1419,60 @@ export function ContentTypesPage() {
                     {contentTypes.data?.length ?? 0} types
                   </div>
                 </div>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  aria-label="Create content type"
-                  onClick={openCreateModal}
-                >
-                  <TbOutlinePlus />
-                </Button>
+                <div class="flex shrink-0 items-center gap-1">
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Create content type"
+                    onClick={openCreateModal}
+                  >
+                    <TbOutlinePlus />
+                  </Button>
+                  <DropdownMenu placement="bottom-end">
+                    <DropdownMenuTrigger
+                      class={buttonVariants({ variant: "ghost", size: "icon" })}
+                      aria-label="Content type actions"
+                      disabled={transferBusy() || busy()}
+                    >
+                      <TbOutlineDotsVertical />
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent>
+                      <DropdownMenuItem
+                        onSelect={() => importFileInput.click()}
+                      >
+                        <TbOutlineUpload /> Import types
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          setExportUids(undefined);
+                          setExportFormat("json");
+                          setModal({ kind: "export" });
+                        }}
+                      >
+                        <TbOutlineDownload /> Export all types
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        disabled={selectedUids().length === 0}
+                        onSelect={() => {
+                          setExportUids([...selectedUids()]);
+                          setExportFormat("json");
+                          setModal({ kind: "export" });
+                        }}
+                      >
+                        <TbOutlineDownload /> Export selected (
+                        {selectedUids().length})
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        class="text-destructive"
+                        disabled={selectedUids().length === 0 || busy()}
+                        onSelect={() => void removeSelected()}
+                      >
+                        <TbOutlineTrash /> Delete selected (
+                        {selectedUids().length})
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               </div>
               <TextField>
                 <TextFieldInput
@@ -930,7 +1486,25 @@ export function ContentTypesPage() {
             </SidebarHeader>
             <SidebarContent>
               <SidebarGroup class="pt-0">
-                <SidebarGroupLabel>Collections</SidebarGroupLabel>
+                <SidebarGroupLabel class="flex items-center justify-between">
+                  <span>Collections</span>
+                  <Checkbox
+                    aria-label="Select all visible content types"
+                    title="Select all visible content types"
+                    disabled={visibleSchemas().length === 0}
+                    checked={visibleSelectionState()}
+                    onChange={(checked) => {
+                      const visibleUids = visibleSchemas().map(
+                        (schema) => schema.uid,
+                      );
+                      setSelectedUids((current) =>
+                        checked
+                          ? [...new Set([...current, ...visibleUids])]
+                          : current.filter((uid) => !visibleUids.includes(uid)),
+                      );
+                    }}
+                  />
+                </SidebarGroupLabel>
                 <SidebarGroupContent>
                   <Show when={contentTypes.isPending}>
                     <div class="text-muted-foreground px-3 py-2 text-sm">
@@ -939,12 +1513,16 @@ export function ContentTypesPage() {
                   </Show>
                   <SidebarMenu>
                     <ContentTypePickerItems
-                      schemas={(contentTypes.data ?? []).filter((schema) =>
-                        `${schema.info.displayName} ${schema.uid}`
-                          .toLowerCase()
-                          .includes(search().toLowerCase()),
-                      )}
+                      schemas={visibleSchemas()}
                       selectedUid={selectedUid()}
+                      selectedUids={selectedUids()}
+                      onToggleSelection={(nextUid, checked) =>
+                        setSelectedUids((current) =>
+                          checked
+                            ? [...new Set([...current, nextUid])]
+                            : current.filter((item) => item !== nextUid),
+                        )
+                      }
                       onSelect={(nextUid) => {
                         setSelectedUid(nextUid);
                         setActiveTab("fields");
@@ -954,11 +1532,7 @@ export function ContentTypesPage() {
                   <Show
                     when={
                       (contentTypes.data?.length ?? 0) > 0 &&
-                      !(contentTypes.data ?? []).some((schema) =>
-                        `${schema.info.displayName} ${schema.uid}`
-                          .toLowerCase()
-                          .includes(search().toLowerCase()),
-                      )
+                      visibleSchemas().length === 0
                     }
                   >
                     <div class="text-muted-foreground px-3 py-2 text-sm">
@@ -978,42 +1552,44 @@ export function ContentTypesPage() {
                 </SidebarGroupContent>
               </SidebarGroup>
             </SidebarContent>
-            <SidebarFooter>
-              <input
-                ref={importFileInput}
-                type="file"
-                accept=".json,.yaml,.yml,application/json,application/yaml,text/yaml"
-                class="hidden"
-                onChange={(event) => {
-                  const file = event.currentTarget.files?.[0];
-                  event.currentTarget.value = "";
-                  if (file) void loadImportFile(file);
-                }}
-              />
-              <DropdownMenu placement="top-end">
-                <DropdownMenuTrigger
-                  class={buttonVariants({ variant: "outline", size: "icon" })}
-                  aria-label="Content type actions"
-                  disabled={transferBusy()}
-                >
-                  <TbOutlineDotsVertical />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent>
-                  <DropdownMenuItem onSelect={() => importFileInput.click()}>
-                    <TbOutlineUpload /> Import types
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      setExportFormat("json");
-                      setModal({ kind: "export" });
-                    }}
-                  >
-                    <TbOutlineDownload /> Export types
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </SidebarFooter>
-            <SidebarRail />
+            <div
+              role="separator"
+              aria-label="Resize content types sidebar"
+              aria-orientation="vertical"
+              aria-valuemin={200}
+              aria-valuemax={480}
+              aria-valuenow={sidebarWidth()}
+              tabIndex={0}
+              class="hover:bg-primary/30 absolute inset-y-0 right-0 z-20 w-1 cursor-col-resize touch-none"
+              onKeyDown={(event) => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  const delta = event.key === "ArrowRight" ? 16 : -16;
+                  setSidebarWidth((width) =>
+                    Math.min(480, Math.max(200, width + delta)),
+                  );
+                }
+              }}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                const startX = event.clientX;
+                const startWidth = sidebarWidth();
+                const move = (moveEvent: PointerEvent) => {
+                  setSidebarWidth(
+                    Math.min(
+                      480,
+                      Math.max(200, startWidth + moveEvent.clientX - startX),
+                    ),
+                  );
+                };
+                const end = () => {
+                  window.removeEventListener("pointermove", move);
+                  window.removeEventListener("pointerup", end);
+                };
+                window.addEventListener("pointermove", move);
+                window.addEventListener("pointerup", end);
+              }}
+            />
           </Sidebar>
 
           <SidebarInset class="h-full overflow-y-auto">
@@ -1037,6 +1613,7 @@ export function ContentTypesPage() {
                           variant="outline"
                           disabled={transferBusy()}
                           onClick={() => {
+                            setExportUids(undefined);
                             setExportFormat("json");
                             setModal({ kind: "export" });
                           }}
@@ -1117,6 +1694,7 @@ export function ContentTypesPage() {
                           variant="outline"
                           disabled={transferBusy()}
                           onClick={() => {
+                            setExportUids(undefined);
                             setExportFormat("json");
                             setModal({ kind: "export" });
                           }}
@@ -1410,8 +1988,8 @@ export function ContentTypesPage() {
           <Show when={definitionMappingRequired()}>
             <div class="flex flex-col gap-3">
               <p class="text-sm">
-                This file does not match the content type bundle format. Map its
-                fields to content type definitions.
+                Map fields from this JSON or YAML file into content type
+                definitions.
               </p>
               <MappingEditor
                 source={definitionImportRoot()}
@@ -1421,8 +1999,9 @@ export function ContentTypesPage() {
                 onExpressionChange={updateDefinitionMapping}
               />
               <p class="text-muted-foreground m-0 text-xs">
-                The result must contain uid, kind, info, and attributes for each
-                content type. The mapped preview appears below.
+                Each mapped definition needs info.singularName and attributes.
+                Missing UID, kind, plural name, and display name are generated.
+                The mapped preview appears below.
               </p>
               <Show when={definitionMappingError()}>
                 <div
@@ -1563,24 +2142,35 @@ export function ContentTypesPage() {
                         Generated column
                       </label>
                       <Show when={fieldDraft().computed}>
-                        <label class="flex flex-col gap-1.5 text-sm font-medium">
-                          Expression
-                          <textarea
-                            class={`${inputStyle} h-24 py-2 font-mono`}
-                            value={fieldDraft().expression}
-                            placeholder="quantity * unit_price"
-                            onInput={(e) =>
-                              setFieldDraft({
-                                ...fieldDraft(),
-                                expression: e.currentTarget.value,
-                              })
-                            }
-                          />
-                          <span class="text-muted-foreground text-xs font-normal">
-                            Use field names, arithmetic, text concatenation, and
-                            COALESCE, ROUND, ABS, LOWER, UPPER, or LENGTH.
-                          </span>
-                        </label>
+                        <Show
+                          when={!fieldDraft().rollup}
+                          fallback={
+                            <div class="bg-muted/30 text-muted-foreground rounded-md p-3 text-sm sm:col-span-2">
+                              Stored SUM of {fieldDraft().rollup?.relation}.
+                              {fieldDraft().rollup?.field}; maintained by the
+                              relation runtime.
+                            </div>
+                          }
+                        >
+                          <label class="flex flex-col gap-1.5 text-sm font-medium">
+                            Expression
+                            <textarea
+                              class={`${inputStyle} h-24 py-2 font-mono`}
+                              value={fieldDraft().expression}
+                              placeholder="quantity * unit_price"
+                              onInput={(e) =>
+                                setFieldDraft({
+                                  ...fieldDraft(),
+                                  expression: e.currentTarget.value,
+                                })
+                              }
+                            />
+                            <span class="text-muted-foreground text-xs font-normal">
+                              Use field names, arithmetic, text concatenation,
+                              and COALESCE, ROUND, ABS, LOWER, UPPER, or LENGTH.
+                            </span>
+                          </label>
+                        </Show>
                         <label class="flex flex-col gap-1.5 text-sm font-medium">
                           Storage mode
                           <select
@@ -1693,38 +2283,465 @@ export function ContentTypesPage() {
                     </label>
                   </Show>
                   <Show when={fieldDraft().type === "relation"}>
-                    <label class="flex flex-col gap-1.5 text-sm font-medium">
-                      Related collection
-                      <select
-                        class={inputStyle}
-                        value={fieldDraft().relationTarget}
-                        onChange={(e) =>
-                          setFieldDraft({
-                            ...fieldDraft(),
-                            relationTarget: e.currentTarget.value,
-                          })
-                        }
-                      >
-                        <option value="">Select a collection type</option>
-                        <For
-                          each={
-                            contentTypes.data?.filter(
-                              (item) => item.kind === "collectionType",
-                            ) ?? []
-                          }
-                        >
-                          {(item) => (
-                            <option value={item.uid}>
-                              {item.info.displayName}
+                    <div class="flex flex-col gap-4">
+                      <div class="grid gap-4 sm:grid-cols-2">
+                        <label class="flex flex-col gap-1.5 text-sm font-medium">
+                          Related collection
+                          <select
+                            class={inputStyle}
+                            value={fieldDraft().relationTarget}
+                            onChange={(e) =>
+                              setFieldDraft({
+                                ...fieldDraft(),
+                                relationTarget: e.currentTarget.value,
+                              })
+                            }
+                          >
+                            <option value="">Select a collection type</option>
+                            <For
+                              each={
+                                contentTypes.data?.filter(
+                                  (item) => item.kind === "collectionType",
+                                ) ?? []
+                              }
+                            >
+                              {(item) => (
+                                <option value={item.uid}>
+                                  {item.info.displayName}
+                                </option>
+                              )}
+                            </For>
+                          </select>
+                        </label>
+                        <label class="flex flex-col gap-1.5 text-sm font-medium">
+                          Relation type
+                          <select
+                            class={inputStyle}
+                            value={fieldDraft().relationCardinality}
+                            onChange={(e) =>
+                              setFieldDraft({
+                                ...fieldDraft(),
+                                relationCardinality: e.currentTarget.value as
+                                  "manyToOne" | "manyToMany",
+                              })
+                            }
+                          >
+                            <option value="manyToOne">Many to one</option>
+                            <option value="manyToMany">
+                              Many to many (with attributes)
                             </option>
-                          )}
-                        </For>
-                      </select>
-                    </label>
+                          </select>
+                        </label>
+                      </div>
+                      <Show
+                        when={fieldDraft().relationCardinality === "manyToMany"}
+                      >
+                        <section class="border-input flex flex-col gap-3 rounded-md border p-4">
+                          <div class="flex items-center justify-between gap-3">
+                            <div>
+                              <h3 class="text-sm font-medium">
+                                Relation attributes
+                              </h3>
+                              <p class="text-muted-foreground text-xs">
+                                Add fields stored on each link between records.
+                              </p>
+                            </div>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={addRelationAttribute}
+                            >
+                              Add attribute
+                            </Button>
+                          </div>
+                          <Show
+                            when={
+                              Object.keys(fieldDraft().relationAttributes)
+                                .length > 0
+                            }
+                            fallback={
+                              <p class="text-muted-foreground text-sm">
+                                This is a simple many-to-many relation. Add
+                                fields such as quantity or unit price to store
+                                values on each link.
+                              </p>
+                            }
+                          >
+                            <For
+                              each={Object.entries(
+                                fieldDraft().relationAttributes,
+                              )}
+                            >
+                              {([attributeName, attribute]) => (
+                                <div class="bg-muted/30 flex flex-col gap-3 rounded-md border p-3">
+                                  <div class="grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
+                                    <label class="flex flex-col gap-1.5 text-xs font-medium">
+                                      Field name
+                                      <input
+                                        class={inputStyle}
+                                        value={attributeName}
+                                        onInput={(e) =>
+                                          updateRelationAttribute(
+                                            attributeName,
+                                            {},
+                                            e.currentTarget.value,
+                                          )
+                                        }
+                                      />
+                                    </label>
+                                    <label class="flex flex-col gap-1.5 text-xs font-medium">
+                                      Type
+                                      <select
+                                        class={inputStyle}
+                                        value={attribute.type}
+                                        onChange={(e) =>
+                                          updateRelationAttribute(
+                                            attributeName,
+                                            { type: e.currentTarget.value },
+                                          )
+                                        }
+                                      >
+                                        <For each={fieldTypeOptions}>
+                                          {(option) => (
+                                            <option value={option.type}>
+                                              {option.label}
+                                            </option>
+                                          )}
+                                        </For>
+                                      </select>
+                                    </label>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      aria-label={`Remove ${attributeName}`}
+                                      onClick={() => {
+                                        const attributes = {
+                                          ...fieldDraft().relationAttributes,
+                                        };
+                                        delete attributes[attributeName];
+                                        setFieldDraft({
+                                          ...fieldDraft(),
+                                          relationAttributes: attributes,
+                                        });
+                                      }}
+                                    >
+                                      Remove
+                                    </Button>
+                                  </div>
+                                  <Show
+                                    when={supportsGenerated(attribute.type)}
+                                  >
+                                    <div class="flex flex-col gap-2">
+                                      <label class="flex items-center gap-2 text-xs">
+                                        <input
+                                          type="checkbox"
+                                          checked={attribute.computed ?? false}
+                                          onChange={(e) =>
+                                            updateRelationAttribute(
+                                              attributeName,
+                                              {
+                                                computed:
+                                                  e.currentTarget.checked,
+                                                ...(e.currentTarget.checked
+                                                  ? { required: false }
+                                                  : {}),
+                                              },
+                                            )
+                                          }
+                                        />
+                                        Generated column
+                                      </label>
+                                      <Show when={attribute.computed}>
+                                        <div class="grid gap-3 sm:grid-cols-2">
+                                          <label class="flex flex-col gap-1.5 text-xs font-medium sm:col-span-2">
+                                            Expression
+                                            <textarea
+                                              class={`${inputStyle} h-20 py-2 font-mono`}
+                                              value={attribute.expression ?? ""}
+                                              placeholder="quantity * unit_price"
+                                              onInput={(e) =>
+                                                updateRelationAttribute(
+                                                  attributeName,
+                                                  {
+                                                    expression:
+                                                      e.currentTarget.value,
+                                                  },
+                                                )
+                                              }
+                                            />
+                                          </label>
+                                          <label class="flex flex-col gap-1.5 text-xs font-medium">
+                                            Storage mode
+                                            <select
+                                              class={inputStyle}
+                                              value={
+                                                attribute.stored === false
+                                                  ? "virtual"
+                                                  : "stored"
+                                              }
+                                              onChange={(e) =>
+                                                updateRelationAttribute(
+                                                  attributeName,
+                                                  {
+                                                    stored:
+                                                      e.currentTarget.value ===
+                                                      "stored",
+                                                  },
+                                                )
+                                              }
+                                            >
+                                              <option value="stored">
+                                                Stored
+                                              </option>
+                                              <option value="virtual">
+                                                Virtual
+                                              </option>
+                                            </select>
+                                          </label>
+                                        </div>
+                                      </Show>
+                                    </div>
+                                  </Show>
+                                  <label class="flex items-center gap-2 text-xs">
+                                    <input
+                                      type="checkbox"
+                                      checked={attribute.required ?? false}
+                                      disabled={attribute.computed ?? false}
+                                      onChange={(e) =>
+                                        updateRelationAttribute(attributeName, {
+                                          required: e.currentTarget.checked,
+                                        })
+                                      }
+                                    />
+                                    Required
+                                  </label>
+                                  <Show when={!attribute.computed}>
+                                    <label class="flex flex-col gap-1.5 text-xs font-medium">
+                                      Default kind
+                                      <select
+                                        class={inputStyle}
+                                        value={
+                                          sqlViewDefaultSql(
+                                            attribute.default,
+                                          ) === undefined
+                                            ? "value"
+                                            : "sqlView"
+                                        }
+                                        onChange={(e) =>
+                                          updateRelationAttribute(
+                                            attributeName,
+                                            {
+                                              default:
+                                                e.currentTarget.value ===
+                                                "sqlView"
+                                                  ? {
+                                                      type: "sqlView",
+                                                      sql: "",
+                                                    }
+                                                  : undefined,
+                                            },
+                                          )
+                                        }
+                                      >
+                                        <option value="value">
+                                          Literal value
+                                        </option>
+                                        <option value="sqlView">
+                                          SQL view
+                                        </option>
+                                      </select>
+                                    </label>
+                                    <Show
+                                      when={
+                                        sqlViewDefaultSql(attribute.default) !==
+                                        undefined
+                                      }
+                                    >
+                                      <label class="flex flex-col gap-1.5 text-xs font-medium">
+                                        SQL view query
+                                        <textarea
+                                          class={`${inputStyle} h-20 py-2 font-mono`}
+                                          value={
+                                            sqlViewDefaultSql(
+                                              attribute.default,
+                                            ) ?? ""
+                                          }
+                                          placeholder="SELECT ... AS value"
+                                          onInput={(e) =>
+                                            updateRelationAttribute(
+                                              attributeName,
+                                              {
+                                                default: {
+                                                  type: "sqlView",
+                                                  sql: e.currentTarget.value,
+                                                },
+                                              },
+                                            )
+                                          }
+                                        />
+                                        <span class="text-muted-foreground text-xs font-normal">
+                                          Use a SELECT or WITH query. For
+                                          relation attributes, NEW.source_id and
+                                          NEW.target_id reference linked
+                                          records.
+                                        </span>
+                                      </label>
+                                    </Show>
+                                    <Show
+                                      when={
+                                        sqlViewDefaultSql(attribute.default) ===
+                                        undefined
+                                      }
+                                    >
+                                      <label class="flex flex-col gap-1.5 text-xs font-medium">
+                                        Default value
+                                        <Show
+                                          when={attribute.type === "boolean"}
+                                          fallback={
+                                            <input
+                                              class={inputStyle}
+                                              type={
+                                                [
+                                                  "integer",
+                                                  "biginteger",
+                                                  "decimal",
+                                                  "float",
+                                                ].includes(attribute.type)
+                                                  ? "number"
+                                                  : "text"
+                                              }
+                                              step={
+                                                ["decimal", "float"].includes(
+                                                  attribute.type,
+                                                )
+                                                  ? "any"
+                                                  : undefined
+                                              }
+                                              value={
+                                                attribute.default === undefined
+                                                  ? ""
+                                                  : typeof attribute.default ===
+                                                      "string"
+                                                    ? attribute.default
+                                                    : JSON.stringify(
+                                                        attribute.default,
+                                                      )
+                                              }
+                                              placeholder="No default"
+                                              onInput={(e) => {
+                                                const value =
+                                                  e.currentTarget.value;
+                                                try {
+                                                  updateRelationAttribute(
+                                                    attributeName,
+                                                    {
+                                                      default:
+                                                        value.trim() === ""
+                                                          ? undefined
+                                                          : parseDefaultValue(
+                                                              attribute.type,
+                                                              value,
+                                                            ),
+                                                    },
+                                                  );
+                                                  setError(undefined);
+                                                } catch {
+                                                  setError(
+                                                    "Enter a valid JSON default value.",
+                                                  );
+                                                }
+                                              }}
+                                            />
+                                          }
+                                        >
+                                          <select
+                                            class={inputStyle}
+                                            value={
+                                              attribute.default === true
+                                                ? "true"
+                                                : attribute.default === false
+                                                  ? "false"
+                                                  : ""
+                                            }
+                                            onChange={(e) =>
+                                              updateRelationAttribute(
+                                                attributeName,
+                                                {
+                                                  default:
+                                                    e.currentTarget.value === ""
+                                                      ? undefined
+                                                      : e.currentTarget
+                                                          .value === "true",
+                                                },
+                                              )
+                                            }
+                                          >
+                                            <option value="">No default</option>
+                                            <option value="true">True</option>
+                                            <option value="false">False</option>
+                                          </select>
+                                        </Show>
+                                      </label>
+                                    </Show>
+                                  </Show>
+                                </div>
+                              )}
+                            </For>
+                          </Show>
+                        </section>
+                      </Show>
+                    </div>
                   </Show>
                   <Show when={!fieldDraft().computed}>
                     <div class="grid gap-4 sm:grid-cols-2">
-                      <Show when={fieldDraft().type === "boolean"}>
+                      <label class="flex flex-col gap-1.5 text-sm font-medium">
+                        Default kind
+                        <select
+                          class={inputStyle}
+                          value={fieldDraft().defaultMode}
+                          onChange={(e) =>
+                            setFieldDraft({
+                              ...fieldDraft(),
+                              defaultMode: e.currentTarget.value as
+                                "value" | "sqlView",
+                              defaultValue: "",
+                              defaultSql: "",
+                            })
+                          }
+                        >
+                          <option value="value">Literal value</option>
+                          <option value="sqlView">SQL view</option>
+                        </select>
+                      </label>
+                      <Show when={fieldDraft().defaultMode === "sqlView"}>
+                        <label class="flex flex-col gap-1.5 text-sm font-medium sm:col-span-2">
+                          SQL view query
+                          <textarea
+                            class={`${inputStyle} h-28 py-2 font-mono`}
+                            value={fieldDraft().defaultSql}
+                            placeholder="SELECT ... AS value"
+                            onInput={(e) =>
+                              setFieldDraft({
+                                ...fieldDraft(),
+                                defaultSql: e.currentTarget.value,
+                              })
+                            }
+                          />
+                          <span class="text-muted-foreground text-xs font-normal">
+                            Use a single SELECT or WITH query. In relation
+                            attributes, NEW.source_id and NEW.target_id refer to
+                            the linked records.
+                          </span>
+                        </label>
+                      </Show>
+                      <Show
+                        when={
+                          fieldDraft().defaultMode === "value" &&
+                          fieldDraft().type === "boolean"
+                        }
+                      >
                         <label class="flex flex-col gap-1.5 text-sm font-medium">
                           Default value
                           <select
@@ -1743,7 +2760,12 @@ export function ContentTypesPage() {
                           </select>
                         </label>
                       </Show>
-                      <Show when={fieldDraft().type !== "boolean"}>
+                      <Show
+                        when={
+                          fieldDraft().defaultMode === "value" &&
+                          fieldDraft().type !== "boolean"
+                        }
+                      >
                         <label class="flex flex-col gap-1.5 text-sm font-medium">
                           Default value
                           <input
@@ -2026,9 +3048,7 @@ export function ContentTypesPage() {
                       setFieldStep("configure");
                     }}
                   >
-                    <span class="border-primary/20 bg-primary/5 text-primary flex size-10 shrink-0 items-center justify-center rounded-sm border text-sm font-semibold">
-                      {option.mark}
-                    </span>
+                    <FieldTypeBadge type={option.type} large />
                     <span class="flex min-w-0 flex-col gap-1">
                       <span class="font-medium">{option.label}</span>
                       <span class="text-muted-foreground text-sm">

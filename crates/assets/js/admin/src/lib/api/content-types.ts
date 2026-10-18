@@ -13,6 +13,8 @@ export type ContentTypeAttribute = {
   regex?: string;
   enumValues?: string[];
   relationTarget?: string;
+  relationCardinality?: "manyToOne" | "manyToMany";
+  attributes?: Record<string, ContentTypeAttribute> | null;
   targetField?: string;
   multiple?: boolean;
   allowedTypes?: string[];
@@ -20,6 +22,12 @@ export type ContentTypeAttribute = {
   expression?: string;
   stored?: boolean;
   dependencies?: string[];
+  rollup?: {
+    relation: string;
+    field: string;
+    aggregate: "sum";
+    stored: true;
+  };
 };
 
 export type ContentTypeView = {
@@ -102,6 +110,14 @@ export async function deleteContentType(uid: string): Promise<void> {
       method: "DELETE",
     },
   );
+  await parseResponse(response);
+}
+
+export async function deleteContentTypes(uids: string[]): Promise<void> {
+  const response = await adminFetch("/content-types", {
+    method: "DELETE",
+    body: JSON.stringify({ uids }),
+  });
   await parseResponse(response);
 }
 

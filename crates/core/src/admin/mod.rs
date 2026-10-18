@@ -68,6 +68,7 @@ pub fn unprotected_admin_router() -> OpenApiRouter<AppState> {
     .routes(routes!(
       content_types::list_content_types,
       content_types::create_content_type,
+      content_types::delete_content_types,
     ))
     .routes(routes!(
       content_types::get_content_type,
