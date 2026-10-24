@@ -1,7 +1,7 @@
 import { For, createEffect, createSignal } from "solid-js";
 
 import { Button } from "@/components/ui/button";
-import { inspectRecordSource } from "@/lib/content-type-transfer";
+import { inspectRecordSource } from "@/lib/data-transfer";
 
 const inputStyle =
   "border-input bg-background h-9 rounded-md border px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring";

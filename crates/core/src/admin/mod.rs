@@ -46,6 +46,10 @@ pub fn unprotected_admin_router() -> OpenApiRouter<AppState> {
     // Row actions.
     .routes(routes!(rows::list_rows::list_rows_handler))
     .routes(routes!(rows::read_files::read_files_handler))
+    .routes(routes!(
+      rows::transfer::export_table_handler,
+      rows::transfer::import_table_handler,
+    ))
     .routes(routes!(rows::delete_rows::delete_rows_handler))
     .routes(routes!(rows::delete_rows::delete_row_handler))
     .routes(routes!(rows::update_row::update_row_handler))
@@ -70,6 +74,7 @@ pub fn unprotected_admin_router() -> OpenApiRouter<AppState> {
       content_types::create_content_type,
       content_types::delete_content_types,
     ))
+    .routes(routes!(content_types::import::import_content_types))
     .routes(routes!(
       content_types::get_content_type,
       content_types::update_content_type,

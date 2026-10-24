@@ -4,6 +4,8 @@
 //! provisions its table and registers a record API, so content remains usable
 //! through TrailBase's normal `/api/{pluralName}` endpoints.
 
+pub(super) mod import;
+
 use axum::{
   Json,
   extract::{Path, State},
@@ -1165,6 +1167,36 @@ fn many_to_many_table_name(source_table: &str, relation_name: &str) -> String {
   format!("{source_table}_rel_{relation_name}")
 }
 
+fn content_type_trigger_names(schema: &ContentTypeSchema, table_name: &str) -> BTreeSet<String> {
+  let mut names = BTreeSet::from([format!("{table_name}_sql_defaults_insert")]);
+  for (relation_name, attribute) in &schema.attributes {
+    if !is_many_to_many(attribute) {
+      continue;
+    }
+    let relation_table = many_to_many_table_name(table_name, relation_name);
+    names.extend([
+      format!("{relation_table}_sql_defaults_insert"),
+      format!("{relation_table}_rollup_insert"),
+      format!("{relation_table}_rollup_delete"),
+      format!("{relation_table}_rollup_update"),
+      format!("{table_name}_rollup_insert_guard_{relation_name}"),
+      format!("{table_name}_rollup_update_guard_{relation_name}"),
+      format!("{table_name}_rollup_init_{relation_name}"),
+    ]);
+  }
+  names
+}
+
+fn drop_content_type_trigger_statements(
+  schema: &ContentTypeSchema,
+  table_name: &str,
+) -> Vec<String> {
+  content_type_trigger_names(schema, table_name)
+    .into_iter()
+    .map(|name| format!("DROP TRIGGER IF EXISTS {}", quote_identifier(&name)))
+    .collect()
+}
+
 fn many_to_many_table_sql(
   table_name: &str,
   source_table: &str,
@@ -1306,6 +1338,10 @@ fn rollup_trigger_statements(
     .map(|(name, _, _)| quote_identifier(name))
     .collect::<Vec<_>>()
     .join(", ");
+  // Keep the target table unaliased in UPDATE statements. SQLite does not
+  // consistently resolve an UPDATE alias inside the correlated aggregate
+  // subquery used by the rollup assignment.
+  let source_row_id = format!("{}.\"id\"", quote_identifier(source_table));
   let mut statements = vec![
     format!(
       "CREATE TRIGGER {} AFTER INSERT ON {} BEGIN \
@@ -1327,12 +1363,12 @@ fn rollup_trigger_statements(
     ),
     format!(
       "CREATE TRIGGER {} AFTER UPDATE ON {} BEGIN \
-         UPDATE {} AS parent SET {} WHERE parent.\"id\" IN (OLD.\"source_id\", NEW.\"source_id\"); \
+         UPDATE {} SET {} WHERE \"id\" IN (OLD.\"source_id\", NEW.\"source_id\"); \
        END",
       quote_identifier(&format!("{relation_table}_rollup_update")),
       quote_identifier(relation_table),
       quote_identifier(source_table),
-      update_for("parent.\"id\"")
+      update_for(&source_row_id)
     ),
   ];
 
@@ -1377,9 +1413,9 @@ fn rollup_trigger_statements(
     insert_assignments.join(", ")
   ));
   statements.push(format!(
-    "UPDATE {} AS parent SET {}",
+    "UPDATE {} SET {}",
     quote_identifier(source_table),
-    update_for("parent.\"id\"")
+    update_for(&source_row_id)
   ));
   statements
 }
@@ -2177,17 +2213,19 @@ pub async fn delete_content_type(
   state
     .validate_and_update_config(config, Some(old_config_hash))
     .await?;
-  let mut drop_statements = schema
-    .attributes
-    .iter()
-    .filter(|(_, attribute)| is_many_to_many(attribute))
-    .map(|(name, _)| {
-      format!(
-        "DROP TABLE IF EXISTS {}",
-        quote_identifier(&many_to_many_table_name(&table_name, name))
-      )
-    })
-    .collect::<Vec<_>>();
+  let mut drop_statements = drop_content_type_trigger_statements(&schema, &table_name);
+  drop_statements.extend(
+    schema
+      .attributes
+      .iter()
+      .filter(|(_, attribute)| is_many_to_many(attribute))
+      .map(|(name, _)| {
+        format!(
+          "DROP TABLE IF EXISTS {}",
+          quote_identifier(&many_to_many_table_name(&table_name, name))
+        )
+      }),
+  );
   drop_statements.push(format!("DROP TABLE {}", quote_identifier(&table_name)));
   let tx_log = conn
     .transaction(move |tx| {
@@ -2310,6 +2348,11 @@ pub async fn delete_content_types(
   // Defer foreign keys while deleting all selected records so cyclic relations
   // do not prevent the cleanup. Drop junction tables before their base tables.
   let mut statements = vec!["PRAGMA defer_foreign_keys = ON".to_string()];
+  for schema in &selected {
+    if let Some(table_name) = schema.table_name.as_deref() {
+      statements.extend(drop_content_type_trigger_statements(schema, table_name));
+    }
+  }
   statements.extend(
     relation_tables
       .iter()

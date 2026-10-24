@@ -56,7 +56,7 @@ import { FilterBar } from "@/components/FilterBar";
 import { DestructiveActionButton } from "@/components/DestructiveActionButton";
 import { IconButton } from "@/components/IconButton";
 import { InsertUpdateRowForm } from "@/components/explorer/InsertUpdateRow";
-import { RecordTransferDialog } from "@/components/explorer/RecordTransferDialog";
+import { RecordTransferDialog } from "@/components/transfer/RecordTransferDialog";
 import {
   RecordApiSettingsForm,
   hasRecordApis,

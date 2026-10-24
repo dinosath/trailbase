@@ -1,65 +1,21 @@
-import { fetchRows } from "@/lib/api/row";
 import { adminFetch } from "@/lib/fetch";
 import { escapeQualifiedName } from "@/lib/schema";
-import type { ContentTypeSchema } from "@/lib/api/content-types";
-import type { SqlValue } from "trailbase-bindings";
 import { parse as parseYaml } from "yaml";
+import type { Table } from "trailbase-bindings";
 
-const TRANSFER_PAGE_SIZE = 500;
-
-function unwrap(value: SqlValue, type?: string): unknown {
-  if (value === "Null") return null;
-  if ("Integer" in value) {
-    if (type === "boolean") return value.Integer !== 0n;
-    const number = Number(value.Integer);
-    return Number.isSafeInteger(number) ? number : value.Integer.toString();
-  }
-  if ("Real" in value) return value.Real;
-  if ("Blob" in value) return value.Blob;
-  if (type === "json" || type === "media") {
-    try {
-      return JSON.parse(value.Text) as unknown;
-    } catch {
-      return value.Text;
-    }
-  }
-  return value.Text;
+export async function exportTableRecords(
+  table: Table,
+  format: "json" | "yaml" | "csv",
+): Promise<Blob> {
+  const response = await adminFetch(
+    `/table/${escapeQualifiedName(table.name)}/export?format=${format}`,
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.blob();
 }
 
-export async function exportContentTypeRecords(
-  schema: ContentTypeSchema,
-): Promise<Record<string, unknown>[]> {
-  if (!schema.tableName) throw new Error("Content type has no backing table");
-  const table = {
-    name: schema.tableName,
-    database_schema: schema.databaseSchema ?? "main",
-  };
-  const output: Record<string, unknown>[] = [];
-
-  for (let page = 0; ; page += 1) {
-    const response = await fetchRows(
-      table,
-      null,
-      TRANSFER_PAGE_SIZE,
-      page,
-      null,
-    );
-    for (const row of response.rows) {
-      const record: Record<string, unknown> = {};
-      response.columns.forEach((column, index) => {
-        record[column.name] = unwrap(
-          row[index],
-          schema.attributes[column.name]?.type,
-        );
-      });
-      output.push(record);
-    }
-    if (response.rows.length < TRANSFER_PAGE_SIZE) return output;
-  }
-}
-
-function toSqlValue(value: unknown, type?: string): SqlValue {
-  if (value === null || value === undefined) return "Null";
+function toImportValue(value: unknown, type?: string): unknown {
+  if (value === null || value === undefined) return null;
   if (
     value === "" &&
     [
@@ -73,74 +29,77 @@ function toSqlValue(value: unknown, type?: string): SqlValue {
       "media",
     ].includes(type ?? "")
   ) {
-    return "Null";
+    return null;
   }
-  if (typeof value === "boolean") return { Integer: value ? 1n : 0n };
+  if (typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value))
       throw new Error("Import contains a non-finite number");
-    return Number.isInteger(value)
-      ? { Integer: BigInt(value) }
-      : { Real: value };
+    return value;
   }
   if (typeof value === "string") {
     if (type === "boolean") {
-      if (["true", "1"].includes(value.toLowerCase())) return { Integer: 1n };
-      if (["false", "0"].includes(value.toLowerCase())) return { Integer: 0n };
+      if (["true", "1"].includes(value.toLowerCase())) return true;
+      if (["false", "0"].includes(value.toLowerCase())) return false;
       throw new Error(`Expected true or false, got ${value}`);
     }
     if (["integer", "biginteger", "relation"].includes(type ?? "")) {
       if (!/^-?\d+$/.test(value))
         throw new Error(`Expected an integer, got ${value}`);
-      return { Integer: BigInt(value) };
+      return value;
     }
     if (["decimal", "float"].includes(type ?? "")) {
       const number = Number(value);
       if (!Number.isFinite(number))
         throw new Error(`Expected a number, got ${value}`);
-      return Number.isInteger(number)
-        ? { Integer: BigInt(number) }
-        : { Real: number };
+      return number;
     }
     if (["json", "media"].includes(type ?? "")) {
       try {
-        return { Text: JSON.stringify(JSON.parse(value) as unknown) };
+        return JSON.parse(value) as unknown;
       } catch {
-        return { Text: value };
+        return value;
       }
     }
-    return { Text: value };
+    return value;
   }
   if (typeof value === "object") {
-    if ("Blob" in value) return value as SqlValue;
-    return { Text: JSON.stringify(value) };
+    return value;
   }
   throw new Error(`Unsupported imported value: ${String(value)}`);
 }
 
-export async function importContentTypeRecords(
-  schema: ContentTypeSchema,
+export async function importTableRecords(
+  table: Table,
   records: Record<string, unknown>[],
   onProgress: (complete: number) => void,
 ): Promise<void> {
-  if (!schema.tableName) throw new Error("Content type has no backing table");
-  for (const [index, record] of records.entries()) {
-    const row: Record<string, SqlValue | undefined> = {};
-    for (const [name, value] of Object.entries(record)) {
-      if (schema.attributes[name]?.computed) continue;
-      row[name] = toSqlValue(value, schema.attributes[name]?.type);
-    }
-    const tableName = escapeQualifiedName({
-      name: schema.tableName,
-      database_schema: schema.databaseSchema ?? "main",
-    });
-    const response = await adminFetch(`/table/${tableName}`, {
-      method: "POST",
-      body: JSON.stringify({ row }),
-    });
-    if (!response.ok) throw new Error(await response.text());
-    onProgress(index + 1);
-  }
+  const fields = table.columns.map((column) => ({
+    name: column.name,
+    type: transferType(column.affinity_type),
+    computed: column.options.some(
+      (option) => typeof option === "object" && "Generated" in option,
+    ),
+  }));
+  const fieldByName = new Map(fields.map((field) => [field.name, field]));
+  const importedRecords = records.map((record) =>
+    Object.fromEntries(
+      Object.entries(record)
+        .filter(([name]) => !fieldByName.get(name)?.computed)
+        .map(([name, value]) => [
+          name,
+          toImportValue(value, fieldByName.get(name)?.type),
+        ]),
+    ),
+  );
+  const tableName = escapeQualifiedName(table.name);
+  const response = await adminFetch(`/table/${tableName}/import`, {
+    method: "POST",
+    body: JSON.stringify({ records: importedRecords }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const result = (await response.json()) as { imported_count: number };
+  onProgress(result.imported_count);
 }
 
 export function parseCsv(source: string): Record<string, unknown>[] {
@@ -331,30 +290,35 @@ function compatibleValue(type: string, value: unknown): boolean {
 }
 
 export function schemaMatchError(
-  schema: ContentTypeSchema,
+  table: Table,
   records: Record<string, unknown>[],
 ): string | undefined {
   if (records.length === 0) return "The file contains no records.";
-  const known = new Set([
-    "id",
-    "created_at",
-    "updated_at",
-    ...Object.keys(schema.attributes),
-  ]);
+  const fields = table.columns.map((column) => ({
+    name: column.name,
+    type: transferType(column.affinity_type),
+    required:
+      column.options.includes("NotNull") &&
+      !column.options.some(
+        (option) => typeof option === "object" && "Default" in option,
+      ),
+    computed: column.options.some(
+      (option) => typeof option === "object" && "Generated" in option,
+    ),
+  }));
+  const known = new Set(fields.map((field) => field.name));
   for (const [index, record] of records.entries()) {
     const unknown = Object.keys(record).find((key) => !known.has(key));
     if (unknown)
       return `Record ${index + 1} has an unknown field “${unknown}”.`;
-    for (const [name, attribute] of Object.entries(schema.attributes)) {
-      if (attribute.computed) continue;
+    for (const field of fields) {
+      const { name, type, required, computed } = field;
+      if (computed) continue;
       const value = record[name];
-      if (
-        attribute.required &&
-        (value === undefined || value === null || value === "")
-      ) {
+      if (required && (value === undefined || value === null || value === "")) {
         return `Record ${index + 1} is missing required field “${name}”.`;
       }
-      if (value !== undefined && !compatibleValue(attribute.type, value)) {
+      if (value !== undefined && !compatibleValue(type, value)) {
         return `Record ${index + 1}, field “${name}”, has an incompatible value.`;
       }
     }
@@ -362,44 +326,18 @@ export function schemaMatchError(
   return undefined;
 }
 
-export function defaultJqMapping(
-  root: unknown,
-  schema: ContentTypeSchema,
-): { expression: string; source: RecordSource } {
-  const source = recordsAtRoot(root);
-  const sample = source.records[0];
-  const candidates: Array<{ key: string; path: string }> = [];
-  const collect = (value: unknown, path: string, depth: number) => {
-    if (!isRecord(value) || depth > 5) return;
-    for (const [key, child] of Object.entries(value)) {
-      const segment = /^[A-Za-z_][\w]*$/.test(key)
-        ? `.${key}`
-        : `.[${JSON.stringify(key)}]`;
-      const childPath = `${path}${segment}`;
-      if (isRecord(child)) collect(child, childPath, depth + 1);
-      else if (!Array.isArray(child)) candidates.push({ key, path: childPath });
-    }
-  };
-  collect(sample, "", 0);
-  const properties = Object.keys(schema.attributes)
-    .filter((name) => !schema.attributes[name].computed)
-    .flatMap((name) => {
-      const candidate = candidates.find(
-        ({ key }) =>
-          key === name ||
-          key.toLowerCase().replace(/[^a-z0-9]/g, "") ===
-            name.toLowerCase().replace(/[^a-z0-9]/g, ""),
-      );
-      if (!candidate) return [];
-      const target = /^[A-Za-z_][\w]*$/.test(name)
-        ? name
-        : JSON.stringify(name);
-      return [`${target}: ${candidate.path || "."}`];
-    });
-  const expression = properties.length
-    ? `${source.selector} | { ${properties.join(", ")} }`
-    : `${source.selector} | {}`;
-  return { expression, source };
+function transferType(affinity: string): string {
+  switch (affinity) {
+    case "Integer":
+      return "integer";
+    case "Real":
+    case "Numeric":
+      return "decimal";
+    case "Blob":
+      return "json";
+    default:
+      return "string";
+  }
 }
 
 function splitTopLevel(source: string, delimiter: string): string[] {
@@ -586,10 +524,12 @@ export function serializeCsv(
 
 export function downloadContent(
   filename: string,
-  content: string,
+  content: string | Blob,
   mimeType: string,
 ) {
-  const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
+  const blob =
+    content instanceof Blob ? content : new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;

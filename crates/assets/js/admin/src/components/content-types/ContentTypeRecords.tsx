@@ -19,6 +19,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { SafeSheet } from "@/components/SafeSheet";
 import { SheetContent } from "@/components/ui/sheet";
 import { FilterBar } from "@/components/FilterBar";
+import { RecordTransferDialog } from "@/components/transfer/RecordTransferDialog";
 import { InsertUpdateRowForm } from "@/components/explorer/InsertUpdateRow";
 import { Table, buildTable } from "@/components/table/Table";
 import { createTableSchemaQuery } from "@/lib/api/table";
@@ -356,6 +357,9 @@ export function ContentTypeRecords(props: { schema: ContentTypeSchema }) {
           </Show>
         </div>
 
+        <Show when={table() && activeView()?.id !== "form"}>
+          <RecordTransferDialog table={table()!} onImported={refetchRows} />
+        </Show>
         <Show when={activeView()?.id !== "form"}>
           <SafeSheet open={[formOpen, setFormOpen]}>
             {(sheet) => (

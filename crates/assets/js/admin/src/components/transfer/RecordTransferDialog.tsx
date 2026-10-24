@@ -13,57 +13,19 @@ import {
 } from "@/components/ui/dialog";
 import { MappingEditor } from "@/components/transfer/MappingEditor";
 import { showToast } from "@/components/ui/toast";
-import type { ContentTypeSchema } from "@/lib/api/content-types";
 import {
   applyJqMapping,
   downloadContent,
-  exportContentTypeRecords,
-  importContentTypeRecords,
+  exportTableRecords,
+  importTableRecords,
   inspectRecordSource,
   parseImportDocument,
   schemaMatchError,
-  serializeCsv,
-} from "@/lib/content-type-transfer";
+} from "@/lib/data-transfer";
 
 const inputStyle =
   "border-input bg-background h-9 rounded-md border px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring";
-
-function tableTransferSchema(table: Table): ContentTypeSchema {
-  const types: Record<string, string> = {
-    Integer: "integer",
-    Real: "decimal",
-    Numeric: "decimal",
-    Text: "string",
-    Blob: "json",
-  };
-  return {
-    uid: table.name.name,
-    kind: "collectionType",
-    info: {
-      singularName: table.name.name,
-      pluralName: table.name.name,
-      displayName: table.name.name,
-    },
-    tableName: table.name.name,
-    databaseSchema: table.name.database_schema ?? "main",
-    attributes: Object.fromEntries(
-      table.columns.map((column) => [
-        column.name,
-        {
-          type: types[column.affinity_type] ?? "string",
-          required:
-            column.options.includes("NotNull") &&
-            !column.options.some(
-              (option) => typeof option === "object" && "Default" in option,
-            ),
-          computed: column.options.some(
-            (option) => typeof option === "object" && "Generated" in option,
-          ),
-        },
-      ]),
-    ),
-  };
-}
+type ImportFormat = "json" | "yaml" | "csv" | "tsv" | "ndjson" | "xml";
 
 export function RecordTransferDialog(props: {
   table: Table;
@@ -71,7 +33,8 @@ export function RecordTransferDialog(props: {
 }) {
   const [open, setOpen] = createSignal(false);
   const [mode, setMode] = createSignal<"import" | "export">("import");
-  const [format, setFormat] = createSignal<"json" | "csv">("json");
+  const [format, setFormat] = createSignal<"json" | "yaml" | "csv">("json");
+  const [importFormat, setImportFormat] = createSignal<ImportFormat>("json");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
   const [rows, setRows] = createSignal<Record<string, unknown>[]>([]);
@@ -81,8 +44,17 @@ export function RecordTransferDialog(props: {
   const [filename, setFilename] = createSignal("");
   const [progress, setProgress] = createSignal(0);
   const [sourceSample, setSourceSample] = createSignal("");
+  const [selectedFile, setSelectedFile] = createSignal<File>();
   let fileInput!: HTMLInputElement;
-  const schema = () => tableTransferSchema(props.table);
+  const acceptedImportTypes = () =>
+    ({
+      json: ".json",
+      yaml: ".yaml,.yml",
+      csv: ".csv",
+      tsv: ".tsv",
+      ndjson: ".ndjson,.jsonl",
+      xml: ".xml",
+    })[importFormat()];
 
   function close() {
     if (busy()) return;
@@ -90,13 +62,20 @@ export function RecordTransferDialog(props: {
     setError(undefined);
   }
 
-  async function loadFile(file: File) {
+  async function loadFile(file: File, selectedFormat = importFormat()) {
+    setRows([]);
+    setSelectedFile(undefined);
+    setError(undefined);
     try {
-      const parsed = parseImportDocument(await file.text(), file.name);
+      const parsed = parseImportDocument(
+        await file.text(),
+        `import.${selectedFormat}`,
+      );
       const source = inspectRecordSource(parsed);
-      const mismatch = schemaMatchError(schema(), source.records);
+      const mismatch = schemaMatchError(props.table, source.records);
       setRoot(parsed);
       setFilename(file.name);
+      setSelectedFile(file);
       setSourceSample(JSON.stringify(source.records[0], null, 2));
       setMappingRequired(Boolean(mismatch));
       if (mismatch) {
@@ -112,6 +91,9 @@ export function RecordTransferDialog(props: {
       setMode("import");
       setOpen(true);
     } catch (err) {
+      setRows([]);
+      setSelectedFile(undefined);
+      setError(err instanceof Error ? err.message : String(err));
       showToast({
         title: "Could not read import file",
         description: err instanceof Error ? err.message : String(err),
@@ -124,7 +106,7 @@ export function RecordTransferDialog(props: {
     try {
       const mapped = applyJqMapping(root(), expression);
       setRows(mapped);
-      setError(schemaMatchError(schema(), mapped));
+      setError(schemaMatchError(props.table, mapped));
     } catch (err) {
       setRows([]);
       setError(err instanceof Error ? err.message : String(err));
@@ -135,25 +117,17 @@ export function RecordTransferDialog(props: {
     setBusy(true);
     setError(undefined);
     try {
-      const records = await exportContentTypeRecords(schema());
+      const records = await exportTableRecords(props.table, format());
       const tableName = props.table.name.name;
-      if (format() === "json") {
-        downloadContent(
-          `${tableName}.json`,
-          `${JSON.stringify(records, null, 2)}\n`,
-          "application/json;charset=utf-8",
-        );
-      } else {
-        downloadContent(
-          `${tableName}.csv`,
-          serializeCsv(records, Object.keys(schema().attributes)),
-          "text/csv;charset=utf-8",
-        );
-      }
+      downloadContent(
+        `${tableName}.${format()}`,
+        records,
+        "application/octet-stream",
+      );
       setOpen(false);
       showToast({
         title: "Export complete",
-        description: `Exported ${records.length} records.`,
+        description: `Exported ${tableName} as ${format().toUpperCase()}.`,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -167,7 +141,7 @@ export function RecordTransferDialog(props: {
     setProgress(0);
     setError(undefined);
     try {
-      await importContentTypeRecords(schema(), rows(), setProgress);
+      await importTableRecords(props.table, rows(), setProgress);
       props.onImported();
       setOpen(false);
       showToast({
@@ -188,7 +162,7 @@ export function RecordTransferDialog(props: {
       <input
         ref={fileInput}
         type="file"
-        accept=".json,.jsonl,.ndjson,.yaml,.yml,.xml,.csv,.tsv,application/json,text/csv,application/yaml,text/yaml,application/xml,text/xml"
+        accept={acceptedImportTypes()}
         class="hidden"
         onChange={(event) => {
           const file = event.currentTarget.files?.[0];
@@ -196,7 +170,22 @@ export function RecordTransferDialog(props: {
           if (file) void loadFile(file);
         }}
       />
-      <Button variant="outline" size="sm" onClick={() => fileInput.click()}>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => {
+          setMode("import");
+          setImportFormat("json");
+          setSelectedFile(undefined);
+          setRows([]);
+          setFilename("");
+          setRoot(undefined);
+          setMapping("");
+          setMappingRequired(false);
+          setError(undefined);
+          setOpen(true);
+        }}
+      >
         <TbOutlineUpload /> Import
       </Button>
       <Button
@@ -222,10 +211,40 @@ export function RecordTransferDialog(props: {
                     Import records into {props.table.name.name}
                   </DialogTitle>
                   <DialogDescription>
-                    {rows().length} rows from {filename()}. The selected table
-                    defines the expected columns.
+                    {selectedFile()
+                      ? `${rows().length} rows from ${filename()}. The selected table defines the expected columns.`
+                      : "Choose a file type and select a file to import into this table."}
                   </DialogDescription>
                 </DialogHeader>
+                <div class="flex flex-wrap items-end gap-3">
+                  <label class="flex min-w-40 flex-col gap-1.5 text-sm font-medium">
+                    File type
+                    <select
+                      class={inputStyle}
+                      value={importFormat()}
+                      onChange={(event) => {
+                        const next = event.currentTarget.value as ImportFormat;
+                        setImportFormat(next);
+                        const file = selectedFile();
+                        if (file) void loadFile(file, next);
+                      }}
+                    >
+                      <option value="json">JSON</option>
+                      <option value="yaml">YAML</option>
+                      <option value="csv">CSV</option>
+                      <option value="tsv">TSV</option>
+                      <option value="ndjson">JSON Lines</option>
+                      <option value="xml">XML</option>
+                    </select>
+                  </label>
+                  <Button
+                    variant="outline"
+                    disabled={busy()}
+                    onClick={() => fileInput.click()}
+                  >
+                    {selectedFile() ? "Choose another file" : "Choose file"}
+                  </Button>
+                </div>
                 <Show when={mappingRequired()}>
                   <div class="flex flex-col gap-3">
                     <p class="text-sm">
@@ -234,9 +253,16 @@ export function RecordTransferDialog(props: {
                     </p>
                     <MappingEditor
                       source={root()}
-                      targetFields={Object.keys(schema().attributes).filter(
-                        (name) => !schema().attributes[name].computed,
-                      )}
+                      targetFields={props.table.columns
+                        .filter(
+                          (column) =>
+                            !column.options.some(
+                              (option) =>
+                                typeof option === "object" &&
+                                "Generated" in option,
+                            ),
+                        )
+                        .map((column) => column.name)}
                       targetLabel="Table columns"
                       expression={mapping()}
                       onExpressionChange={updateMapping}
@@ -276,10 +302,13 @@ export function RecordTransferDialog(props: {
                 class={inputStyle}
                 value={format()}
                 onChange={(event) =>
-                  setFormat(event.currentTarget.value as "json" | "csv")
+                  setFormat(
+                    event.currentTarget.value as "json" | "yaml" | "csv",
+                  )
                 }
               >
                 <option value="json">JSON</option>
+                <option value="yaml">YAML</option>
                 <option value="csv">CSV</option>
               </select>
             </label>

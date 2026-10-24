@@ -78,7 +78,7 @@ import {
   downloadContent,
   inspectRecordSource,
   parseImportDocument,
-} from "@/lib/content-type-transfer";
+} from "@/lib/data-transfer";
 
 function normalizeContentTypeBundle(
   value: unknown,
@@ -507,9 +507,7 @@ function withoutSqlViewDefaults(
 ): ContentTypeAttribute {
   const { default: defaultValue, ...withoutDefault } = attribute;
   const result =
-    sqlViewDefaultSql(defaultValue) === undefined
-      ? attribute
-      : withoutDefault;
+    sqlViewDefaultSql(defaultValue) === undefined ? attribute : withoutDefault;
   if (!attribute.attributes) return result;
   return {
     ...result,
